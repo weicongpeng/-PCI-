@@ -1822,23 +1822,23 @@ class LTENRPCIPlanner:
     def assign_pci_with_reuse_priority(self, enodeb_id: int, cell_id: int) -> Tuple[Optional[int], str, float, float]:
         """
         优先确保复用距离的PCI分配方法
-        
+
         Returns:
             (assigned_pci, reason, earfcn_dl, actual_min_reuse_distance)
             assigned_pci: 分配的PCI值，如果无法分配则为None
         """
         # 获取小区信息
         cell_info, status = self.get_cell_info(enodeb_id, cell_id)
-        
+
         if status != 'success':
-            # 对于找不到的小区或缺少位置信息的小区，使用保底分配
+            # 对于找不到的小区或缺少位置信息的小区，不进行PCI分配
             if status == 'cell_not_found':
-                fallback_pci = (enodeb_id + cell_id) % len(self.pci_range)
-                return fallback_pci, 'cell_not_found_fallback', 0.0, 0.0
+                # 小区未找到，返回None表示不分配PCI
+                return None, 'cell_not_found_no_pci', 0.0, 0.0
             elif status == 'no_location':
-                fallback_pci = (enodeb_id + cell_id + 100) % len(self.pci_range)
+                # 缺少位置信息，不进行PCI分配，按优化要求返回特定格式
                 earfcn_dl = cell_info['earfcn_dl'] if cell_info is not None else 0.0
-                return fallback_pci, 'no_location_fallback', earfcn_dl, 0.0
+                return None, 'no_location_fallback', earfcn_dl, 0.0
         
         target_lat = cell_info['lat']
         target_lon = cell_info['lon']
@@ -2030,9 +2030,10 @@ class LTENRPCIPlanner:
         
         # 2. 清除距离缓存（避免使用旧的干扰计算结果）
         cell_info, _ = self.get_cell_info(enodeb_id, cell_id)
+        distance_keys = []  # 初始化变量，提供安全默认值
         if cell_info is not None and not pd.isna(cell_info['lat']) and not pd.isna(cell_info['lon']):
-            distance_keys = [k for k in self.distance_cache.keys() 
-                           if k[0] == round(cell_info['lat'], 6) 
+            distance_keys = [k for k in self.distance_cache.keys()
+                           if k[0] == round(cell_info['lat'], 6)
                            and k[1] == round(cell_info['lon'], 6)]
             for key in distance_keys:
                 del self.distance_cache[key]
@@ -2055,7 +2056,7 @@ class LTENRPCIPlanner:
         """
         print("\\n正在验证最终复用距离...")
         min_reuse_distances = []
-        
+
         for idx, cell in result_df.iterrows():
             # 根据网络类型获取正确的列名
             if self.network_type == "NR":
@@ -2064,32 +2065,37 @@ class LTENRPCIPlanner:
                 enodeb_id = cell.get('eNodeBID')
             cell_id = cell.get('CellID')
             assigned_pci = cell.get('分配的PCI')
-            
+
+            # 处理PCI分配为None的情况（无位置信息的小区）
+            if assigned_pci is None:
+                min_reuse_distances.append("位置信息缺失")
+                continue
+
             if assigned_pci == -1:
                 min_reuse_distances.append("分配失败")
                 continue
-            
+
             # 获取当前小区信息
             cell_info, status = self.get_cell_info(enodeb_id, cell_id)
-            
+
             if status != 'success' or pd.isna(cell_info['lat']) or pd.isna(cell_info['lon']):
                 min_reuse_distances.append("位置信息缺失")
                 continue
-            
+
             # 验证实际复用距离（同频检查）
             _, actual_min_distance = self.validate_pci_reuse_distance(
                 assigned_pci, cell_info['lat'], cell_info['lon'], cell_info['earfcn_dl'], enodeb_id, cell_id
             )
-            
+
             # 保持数值格式，特殊情况使用字符串
             if actual_min_distance == float('inf'):
                 min_reuse_distances.append("无复用PCI")
             else:
                 min_reuse_distances.append(round(actual_min_distance, 2))
-            
+
             if (idx + 1) % 100 == 0 or (idx + 1) == len(result_df):
                 print(f"已验证 {idx+1}/{len(result_df)} 个小区的复用距离")
-        
+
         return min_reuse_distances
     
     def plan_pci_with_reuse_priority(self) -> pd.DataFrame:
@@ -2194,7 +2200,10 @@ class LTENRPCIPlanner:
 
         print(f"总共 {len(processing_order)} 个小区需要处理")
 
-        # 按新的顺序处理小区
+        # 按新的顺序处理小区，但保持原始索引对应关系
+        # 关键修复：使用索引对应的数据结构，避免顺序错位
+        results_by_index = {}
+
         for order_idx, (idx, cell) in enumerate(processing_order):
             # 根据网络类型选择正确的基站ID列
             if self.network_type == "NR":
@@ -2202,11 +2211,11 @@ class LTENRPCIPlanner:
             else:
                 enodeb_id = cell.get('eNodeBID')
             cell_id = cell.get('CellID')
-            
+
             # 显示进度
             if (order_idx + 1) % 50 == 0 or (order_idx + 1) == len(processing_order):
                 print(f"正在规划小区 {order_idx+1}/{len(processing_order)}")
-            
+
             # 获取原PCI信息和小区名称
             cell_info, _ = self.get_cell_info(enodeb_id, cell_id)
             original_pci = cell_info['pci'] if cell_info is not None else None
@@ -2218,24 +2227,14 @@ class LTENRPCIPlanner:
                     cell_name = f"小区_{enodeb_id}_{cell_id}"
             else:
                 cell_name = f"小区_{enodeb_id}_{cell_id}"
-            
-            original_pcis.append(original_pci)
-            cell_names.append(cell_name)
-            
-            # 计算原PCI的模值
-            original_mod = self.calculate_pci_mod(original_pci)
-            original_mods.append(original_mod)
-            
+
             # 分配PCI（优先确保复用距离）
             assigned_pci, reason, earfcn_dl, predicted_distance = self.assign_pci_with_reuse_priority(enodeb_id, cell_id)
-            assigned_pcis.append(assigned_pci)
-            earfcn_dls.append(earfcn_dl)
-            assignment_reasons.append(reason)
-            predicted_min_distances.append(predicted_distance)
-            
-            # 立即更新小区PCI（关键修改：确保后续同站点小区能看到最新的PCI分配）
-            self.update_cell_pci(enodeb_id, cell_id, assigned_pci)
-            
+
+            # 仅当成功分配PCI时才更新小区PCI（优化：无位置信息不更新）
+            if assigned_pci is not None and assigned_pci != -1:
+                self.update_cell_pci(enodeb_id, cell_id, assigned_pci)
+
             # 记录特殊情况
             if 'not_found' in reason:
                 self.failure_reasons['cell_not_found'].append(f"{enodeb_id}-{cell_id}")
@@ -2245,19 +2244,31 @@ class LTENRPCIPlanner:
                 self.failure_reasons['no_compliant_pci'].append(f"{enodeb_id}-{cell_id}")
             elif 'fallback' in reason:
                 self.failure_reasons['fallback_assignments'].append(f"{enodeb_id}-{cell_id}")
-            
-            # 计算分配PCI的模值
+
+            # 计算模值
+            original_mod = self.calculate_pci_mod(original_pci)
             assigned_mod = self.calculate_pci_mod(assigned_pci)
-            assigned_mods.append(assigned_mod)
 
             # 比较模值
             if original_mod is not None and assigned_mod is not None:
                 mod_same = '是' if original_mod == assigned_mod else '否'
             else:
                 mod_same = '无法比较'
-            mod_same_flags.append(mod_same)
 
-            # 关键修复：检查同站模冲突并记录
+            # 关键修复：按原始索引存储结果，确保对应关系正确
+            results_by_index[idx] = {
+                'cell_name': cell_name,
+                'original_pci': original_pci,
+                'original_mod': original_mod,
+                'assigned_pci': assigned_pci,
+                'assigned_mod': assigned_mod,
+                'mod_same': mod_same,
+                'earfcn_dl': earfcn_dl,
+                'assignment_reason': reason,
+                'predicted_distance': predicted_distance
+            }
+
+            # 仅当成功分配PCI时才检查同站模冲突（优化：无位置信息不检查）
             if assigned_pci is not None and assigned_pci != -1:
                 cell_info, _ = self.get_cell_info(enodeb_id, cell_id)
                 if cell_info is not None and pd.notna(cell_info.get('lat')) and pd.notna(cell_info.get('lon')):
@@ -2283,10 +2294,10 @@ class LTENRPCIPlanner:
                 else:
                     print(f"      警告：无法检查同站点冲突 - 缺少位置信息")
         
-        # 添加所有新列，根据网络类型调整列结构
+        # 关键修复：按原始索引正确组装数据，避免顺序错位
         # 先保存原有的列
         original_columns = list(result_df.columns)
-        
+
         # 根据网络类型决定是否包含eNodeBID列
         if self.network_type == "NR":
             # NR网络：删除eNodeBID列，只保留CellID和小区名称
@@ -2301,34 +2312,79 @@ class LTENRPCIPlanner:
         else:
             # LTE网络：保持原有结构，在第3列插入小区名称
             new_columns = original_columns[:2] + ['小区名称'] + original_columns[2:]
-        
-        # 重新组织DataFrame
+
+        # 关键修复：按原始索引顺序组装数据，确保对应关系正确
         result_df_new = pd.DataFrame()
-        for i, col in enumerate(new_columns):
+
+        # 首先组装原始列（保持原始顺序）
+        for col in new_columns:
             if col == '小区名称':
-                result_df_new[col] = cell_names
+                # 按原始索引顺序组装小区名称
+                ordered_cell_names = []
+                for idx in result_df.index:
+                    if idx in results_by_index:
+                        ordered_cell_names.append(results_by_index[idx]['cell_name'])
+                    else:
+                        # 对于没有处理结果的小区，使用默认名称
+                        if self.network_type == "NR":
+                            enodeb_id = result_df.loc[idx, 'gNodeBID'] if 'gNodeBID' in result_df.columns else 'Unknown'
+                        else:
+                            enodeb_id = result_df.loc[idx, 'eNodeBID'] if 'eNodeBID' in result_df.columns else 'Unknown'
+                        cell_id = result_df.loc[idx, 'CellID'] if 'CellID' in result_df.columns else 'Unknown'
+                        ordered_cell_names.append(f"小区_{enodeb_id}_{cell_id}")
+                result_df_new[col] = ordered_cell_names
             elif col in original_columns:
-                # 只添加存在的原始列
+                # 保持原始列的数据顺序
                 result_df_new[col] = result_df[col].values
-        
-        # 添加其他新列
+
+        # 添加其他新列（按原始索引顺序）
+        ordered_original_pcis = []
+        ordered_assigned_pcis = []
+        ordered_original_mods = []
+        ordered_assigned_mods = []
+        ordered_mod_same_flags = []
+        ordered_earfcn_dls = []
+        ordered_assignment_reasons = []
+        ordered_predicted_distances = []
+
+        for idx in result_df.index:
+            if idx in results_by_index:
+                ordered_original_pcis.append(results_by_index[idx]['original_pci'])
+                ordered_assigned_pcis.append(results_by_index[idx]['assigned_pci'])
+                ordered_original_mods.append(results_by_index[idx]['original_mod'])
+                ordered_assigned_mods.append(results_by_index[idx]['assigned_mod'])
+                ordered_mod_same_flags.append(results_by_index[idx]['mod_same'])
+                ordered_earfcn_dls.append(results_by_index[idx]['earfcn_dl'])
+                ordered_assignment_reasons.append(results_by_index[idx]['assignment_reason'])
+                ordered_predicted_distances.append(results_by_index[idx]['predicted_distance'])
+            else:
+                # 对于没有处理结果的小区，使用默认值
+                ordered_original_pcis.append(None)
+                ordered_assigned_pcis.append(None)
+                ordered_original_mods.append(None)
+                ordered_assigned_mods.append(None)
+                ordered_mod_same_flags.append('无法比较')
+                ordered_earfcn_dls.append(0.0)
+                ordered_assignment_reasons.append('未处理')
+                ordered_predicted_distances.append(0.0)
+
         result_df_new['网络类型'] = self.network_type
-        result_df_new['原PCI'] = original_pcis
-        result_df_new['分配的PCI'] = assigned_pcis
-        
+        result_df_new['原PCI'] = ordered_original_pcis
+        result_df_new['分配的PCI'] = ordered_assigned_pcis
+
         # 根据网络类型设置模值列名
         if self.network_type == "LTE":
-            result_df_new['原PCI模3'] = original_mods
-            result_df_new['新PCI模3'] = assigned_mods
-            result_df_new['模3是否相同'] = mod_same_flags
+            result_df_new['原PCI模3'] = ordered_original_mods
+            result_df_new['新PCI模3'] = ordered_assigned_mods
+            result_df_new['模3是否相同'] = ordered_mod_same_flags
         else:
-            result_df_new['原PCI模30'] = original_mods
-            result_df_new['新PCI模30'] = assigned_mods
-            result_df_new['模30是否相同'] = mod_same_flags
-        
-        result_df_new['earfcnDl'] = earfcn_dls
-        result_df_new['分配原因'] = assignment_reasons
-        
+            result_df_new['原PCI模30'] = ordered_original_mods
+            result_df_new['新PCI模30'] = ordered_assigned_mods
+            result_df_new['模30是否相同'] = ordered_mod_same_flags
+
+        result_df_new['earfcnDl'] = ordered_earfcn_dls
+        result_df_new['分配原因'] = ordered_assignment_reasons
+
         # 更新result_df
         result_df = result_df_new
         
