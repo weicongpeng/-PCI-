@@ -1342,9 +1342,10 @@ class LTENRPCIPlanner:
         if self.all_cells_combined is None or self.all_cells_combined.empty:
             return True, float('inf')
         
-        # 生成缓存键
+        # 生成缓存键 - 关键修复：包含复用距离参数
         cache_key = (candidate_pci, round(target_lat, 6), round(target_lon, 6), 
-                    round(target_earfcn, 2), exclude_enodeb, exclude_cell)
+                    round(target_earfcn, 2), exclude_enodeb, exclude_cell, 
+                    round(self.reuse_distance_km, 2))
         
         if cache_key in self.pci_validity_cache:
             return self.pci_validity_cache[cache_key]
@@ -1634,72 +1635,79 @@ class LTENRPCIPlanner:
             print(f"    同站点已有模3值: {sorted(list(same_site_assigned_mods))}")
             print(f"    候选PCI模3值分布: {sorted(list(mod_groups.keys()))}")
 
-            # 强制选择未被使用的模3值
-            available_mod_groups = {mod: pci_list for mod, pci_list in mod_groups.items()
-                                  if mod not in same_site_assigned_mods}
-
-            if available_mod_groups:
-                # 有可用模3值，优先选择 - 包含所有可用PCI而不仅仅是每个组的最佳PCI
-                final_pcis = []
-                for mod_value, pci_list in available_mod_groups.items():
-                    # 对每个模3组内的所有PCI进行排序（复用距离优先）
-                    pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
-                    # 包含该mod组内的所有PCI，而不仅仅是第一个，以提供更多选择
-                    final_pcis.extend(pci_list)
-
-                # 再次筛选，确保只保留无冲突的PCI
-                final_pcis = [(pci, distance, conflict, balance) for pci, distance, conflict, balance in final_pcis
-                             if (pci % self.mod_value) not in same_site_assigned_mods]
-
-                print(f"    成功找到{len(final_pcis)}个无同站点模3冲突的PCI")
-
-                if not final_pcis:
-                    # 如果筛选后没有可用PCI，放宽限制但仍优先选择不同mod值
-                    print(f"    警告：严格筛选后无可用PCI，将放宽限制但仍优先避免同mod")
+            # 关键修复：LTE网络必须保证同站3个小区模3值不同
+            # 如果同站点已有2个不同模3值，必须选择第3个不同的模3值
+            if len(same_site_assigned_mods) >= 2:
+                print(f"    同站点已有{len(same_site_assigned_mods)}个不同模3值，必须选择不同的模3值")
+                # 强制选择未被使用的模3值
+                available_mod_groups = {mod: pci_list for mod, pci_list in mod_groups.items()
+                                      if mod not in same_site_assigned_mods}
+                
+                if available_mod_groups:
+                    # 有可用模3值，优先选择
+                    final_pcis = []
                     for mod_value, pci_list in available_mod_groups.items():
+                        # 对每个模3组内的PCI进行排序（复用距离优先）
                         pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
                         final_pcis.extend(pci_list)
-            else:
-                # 所有模3值都被使用，这是严重问题 - 需要强制选择不同mod值
-                print(f"    严重警告：所有模3值都已被同站点小区使用，违反LTE同站3小区模3错开原则！")
-                print(f"    同站点已有模3值: {sorted(list(same_site_assigned_mods))}")
-                print(f"    候选PCI模3值分布: {sorted(list(mod_groups.keys()))}")
+                    print(f"    成功找到{len(final_pcis)}个无同站点模3冲突的PCI")
+                else:
+                    # 所有模3值都被使用，这是严重问题 - 需要强制选择不同的模3值
+                    print(f"    严重警告：所有模3值都已被同站点小区使用，违反LTE同站3小区模3错开原则！")
+                    
+                    # 统计每个mod值的使用次数
+                    mod_usage_count = {}
+                    for mod in same_site_assigned_mods:
+                        mod_usage_count[mod] = 0
 
-                # 关键修复：即使所有mod值都已被使用，也要强制选择使用次数最少的mod值
-                # 统计每个mod值的使用次数
-                mod_usage_count = {}
-                for mod in same_site_assigned_mods:
-                    mod_usage_count[mod] = 0
+                    # 计算每个mod值在同站点的使用次数
+                    for cell in same_site_cells_for_check:
+                        if 'pci' in cell and pd.notna(cell['pci']) and cell['pci'] != -1:
+                            cell_mod = int(cell['pci']) % self.mod_value
+                            if cell_mod in mod_usage_count:
+                                mod_usage_count[cell_mod] += 1
 
-                # 计算每个mod值在同站点的使用次数
-                for cell in same_site_cells_for_check:
-                    if 'pci' in cell and pd.notna(cell['pci']) and cell['pci'] != -1:
-                        cell_mod = int(cell['pci']) % self.mod_value
-                        if cell_mod in mod_usage_count:
-                            mod_usage_count[cell_mod] += 1
+                    # 找到使用次数最少的mod值
+                    if mod_usage_count:
+                        min_usage_mod = min(mod_usage_count.keys(), key=lambda x: mod_usage_count[x])
+                        print(f"    使用次数最少的mod值: {min_usage_mod} (使用次数: {mod_usage_count[min_usage_mod]})")
 
-                # 找到使用次数最少的mod值
-                if mod_usage_count:
-                    min_usage_mod = min(mod_usage_count.keys(), key=lambda x: mod_usage_count[x])
-                    print(f"    使用次数最少的mod值: {min_usage_mod} (使用次数: {mod_usage_count[min_usage_mod]})")
-
-                    # 优先选择使用次数最少的mod值的PCI
-                    if min_usage_mod in mod_groups:
-                        best_mod_pci_list = mod_groups[min_usage_mod]
-                        best_mod_pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
-                        final_pcis = best_mod_pci_list
+                        # 优先选择使用次数最少的mod值的PCI
+                        if min_usage_mod in mod_groups:
+                            best_mod_pci_list = mod_groups[min_usage_mod]
+                            best_mod_pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
+                            final_pcis = best_mod_pci_list
+                        else:
+                            # 如果没有找到，从所有mod组中选择
+                            final_pcis = []
+                            for mod_value, pci_list in mod_groups.items():
+                                pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
+                                final_pcis.extend(pci_list)
                     else:
-                        # 如果没有找到，从所有mod组中选择
+                        # 如果没有使用统计，从所有mod组中选择
                         final_pcis = []
                         for mod_value, pci_list in mod_groups.items():
                             pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
                             final_pcis.extend(pci_list)
+            else:
+                # 同站点模3值不足2个，可以自由选择但优先避免冲突
+                available_mod_groups = {mod: pci_list for mod, pci_list in mod_groups.items()
+                                      if mod not in same_site_assigned_mods}
+                
+                if available_mod_groups:
+                    # 优先选择未被使用的模3值
+                    final_pcis = []
+                    for mod_value, pci_list in available_mod_groups.items():
+                        pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
+                        final_pcis.extend(pci_list)
+                    print(f"    成功找到{len(final_pcis)}个无同站点模3冲突的PCI")
                 else:
-                    # 如果没有使用统计，从所有mod组中选择
+                    # 如果没有可用模3值，使用所有候选PCI
                     final_pcis = []
                     for mod_value, pci_list in mod_groups.items():
                         pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
                         final_pcis.extend(pci_list)
+                    print(f"    使用所有候选PCI，共{len(final_pcis)}个")
         else:
             # NR网络或非LTE网络的原有逻辑
             # 新优先级策略：复用距离 > 同站点模值冲突避免 > PCI分布均衡性
@@ -1792,19 +1800,28 @@ class LTENRPCIPlanner:
             # 优先级1：同站点模值冲突（最高优先级）- 绝对不允许同站同模
             mod_conflict_priority = 0 if not has_mod_conflict else 1
             
-            # 优先级2：复用距离（第二优先级）- 距离越大越安全
+            # 优先级2：复用距离合规性（第二优先级）- 必须满足用户设定的最小复用距离
+            # 关键修复：优先选择满足复用距离要求的PCI
+            if distance == float('inf'):
+                distance_compliance = 0  # 无复用PCI最优
+            elif distance >= self.reuse_distance_km:
+                distance_compliance = 0  # 满足复用距离要求
+            else:
+                distance_compliance = 1  # 不满足复用距离要求
+            
+            # 优先级3：复用距离大小（第三优先级）- 距离越大越安全
             if distance == float('inf'):
                 distance_priority = -999999  # 无复用PCI最优
             else:
                 distance_priority = -distance  # 距离大的优先
             
-            # 优先级3：PCI分布均衡性（第三优先级）- 越接近阈值越好
+            # 优先级4：PCI分布均衡性（第四优先级）- 越接近阈值越好
             balance_priority = balance_score
             
-            # 优先级4：PCI值（第四优先级）- 小的优先，确保确定性
+            # 优先级5：PCI值（第五优先级）- 小的优先，确保确定性
             pci_priority = pci
             
-            return (mod_conflict_priority, distance_priority, balance_priority, pci_priority)
+            return (mod_conflict_priority, distance_compliance, distance_priority, balance_priority, pci_priority)
         
         final_pcis.sort(key=sort_key)
         
@@ -1853,8 +1870,10 @@ class LTENRPCIPlanner:
         compliant_pcis = self.get_reuse_compliant_pcis(
             target_lat, target_lon, earfcn_dl, enodeb_id, cell_id, target_mod
         )
-        # 专项修复：强制保留不同模3值的候选PCI
-        if len(compliant_pcis) > 0:
+        # 关键修复：对于LTE网络，不再进行额外的模3均衡化处理，避免破坏同站点模3检查逻辑
+        # 因为get_reuse_compliant_pcis方法已经包含了完善的LTE同站点模3错开逻辑
+        if self.network_type != "LTE" and len(compliant_pcis) > 0:
+            # 仅对非LTE网络进行模3均衡化处理
             # 按模3值分组
             mod_groups = {}
             for pci_info in compliant_pcis:
@@ -1896,26 +1915,9 @@ class LTENRPCIPlanner:
             
             compliant_pcis = balanced_pcis
             print(f"  模3均衡化处理后候选PCI数量: {len(compliant_pcis)} (含{len(mod_groups)}种模3值)")
-        
-        # 专项修复：确保候选PCI包含不同模3值（保持4元组结构）
-        if len(compliant_pcis) > 10:  # 当候选较多时强制分散模3值
-            mod_distribution = {}
-            for pci_info in compliant_pcis:
-                pci, distance, has_mod_conflict, balance_score = pci_info
-                mod = pci % self.mod_value
-                if mod not in mod_distribution:
-                    mod_distribution[mod] = []
-                mod_distribution[mod].append((pci, distance, has_mod_conflict, balance_score))
-
-            # 确保每个模3组最多保留3个最佳候选
-            balanced_pcis = []
-            for mod in mod_distribution:
-                # 按距离和均衡性排序（4元组结构）
-                mod_distribution[mod].sort(key=lambda x: (-x[1], x[3]))
-                balanced_pcis.extend(mod_distribution[mod][:3])
-
-            compliant_pcis = balanced_pcis
-            print(f"  模3均衡化处理后候选PCI数量: {len(compliant_pcis)}")
+        else:
+            # LTE网络直接使用get_reuse_compliant_pcis返回的结果，不进行额外处理
+            print(f"  LTE网络：使用get_reuse_compliant_pcis的完整结果，共{len(compliant_pcis)}个候选PCI")
         
         if not compliant_pcis:
             # 根据新的优先级策略：复用距离 > 分配成功率 > PCI不冲突 > 模3不相同
