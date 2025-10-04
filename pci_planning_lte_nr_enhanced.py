@@ -1108,10 +1108,12 @@ class LTENRPCIPlanner:
             self.pci_range = list(range(0, 504))  # LTE PCI范围 0-503
             self.inherit_mod = lte_inherit_mod3
             self.mod_value = 3  # LTE使用mod3
+            self.dual_mod_requirement = False  # LTE只需要模3约束
         else:  # NR
             self.pci_range = list(range(0, 1008))  # NR PCI范围 0-1007
             self.inherit_mod = nr_inherit_mod30
             self.mod_value = 30  # NR使用mod30
+            self.dual_mod_requirement = True   # NR需要同时满足模3和模30约束
         
         # 数据存储
         self.cells_to_plan = None
@@ -1484,6 +1486,7 @@ class LTENRPCIPlanner:
         """
         检查候选PCI是否与同站点小区的模值冲突
         真正基于经纬度判断同站点
+        支持NR网络的双模约束（同时检查模3和模30冲突）
 
         Args:
             candidate_pci: 候选PCI值
@@ -1524,6 +1527,37 @@ class LTENRPCIPlanner:
                 # 同站点已经有3个不同模值，且候选PCI的模值已经存在，禁止分配
                 print(f"      [DEBUG] 发现LTE同站点模{self.mod_value}冲突: 候选PCI={candidate_pci} (mod{self.mod_value}={candidate_mod})")
                 print(f"      [DEBUG] 同站点已有模{self.mod_value}值: {sorted(existing_mods)} (已达3种不同值)")
+                return False
+
+        # 对于NR网络，需要同时检查模3和模30冲突
+        if self.network_type == "NR" and self.dual_mod_requirement:
+            # 检查模3冲突
+            candidate_mod3 = candidate_pci % 3
+            existing_mod3s = []
+            mod3_conflict_cells = []
+            
+            for cell in same_site_cells:
+                existing_pci = cell['pci']
+                if pd.notna(existing_pci) and existing_pci != -1:
+                    existing_mod3 = int(existing_pci) % 3
+                    existing_mod3s.append(existing_mod3)
+                    if existing_mod3 == candidate_mod3:
+                        enodeb_id = cell.get('enodeb_id', 'N/A')
+                        cell_id = cell.get('cell_id', 'N/A')
+                        mod3_conflict_cells.append(f"基站{enodeb_id}-小区{cell_id}(PCI{existing_pci})")
+            
+            # 检查同站点是否已有3个不同模3值
+            unique_mod3s = set(existing_mod3s)
+            if len(unique_mod3s) >= 3 and candidate_mod3 in unique_mod3s:
+                print(f"      [DEBUG] 发现NR同站点模3冲突: 候选PCI={candidate_pci} (mod3={candidate_mod3})")
+                print(f"      [DEBUG] 同站点已有模3值: {sorted(existing_mod3s)} (已达3种不同值)")
+                return False
+            
+            # 检查模3冲突
+            if mod3_conflict_cells:
+                print(f"      [DEBUG] 发现NR同站点模3冲突: 候选PCI={candidate_pci} (mod3={candidate_mod3})")
+                print(f"      [DEBUG] 模3冲突小区: {', '.join(mod3_conflict_cells)}")
+                print(f"      [DEBUG] 同站点已有模3值: {sorted(existing_mod3s)}")
                 return False
 
         # 如果发现冲突，记录详细信息
@@ -1583,6 +1617,28 @@ class LTENRPCIPlanner:
             # 检查同站点是否已经有3个不同模值
             if len(same_site_mods) >= 3:
                 print(f"    警告：同站点已有3种不同模{self.mod_value}值，将强制选择不同模值")
+        
+        # 对于NR网络，需要同时考虑模3和模30约束
+        if self.network_type == "NR" and self.dual_mod_requirement:
+            print(f"    NR双模约束模式：将同时避免同站点模3和模30冲突")
+            # 统计同站点已有的模3值
+            same_site_mod3s = set()
+            for cell in same_site_cells:
+                pci_value = cell.get('pci')
+                original_pci = cell.get('原PCI')
+                
+                # 首先检查已分配的PCI
+                if pd.notna(pci_value) and pci_value != -1:
+                    same_site_mod3s.add(int(pci_value) % 3)
+                # 如果没有分配PCI，检查原PCI
+                elif pd.notna(original_pci) and original_pci != -1:
+                    same_site_mod3s.add(int(original_pci) % 3)
+            
+            print(f"    同站点已有模3值: {sorted(list(same_site_mod3s))}")
+            
+            # 检查同站点是否已经有3个不同模3值
+            if len(same_site_mod3s) >= 3:
+                print(f"    警告：同站点已有3种不同模3值，将强制选择不同模3值")
         
         # 检查候选PCI
         for pci in candidate_pcis:
@@ -1716,82 +1772,113 @@ class LTENRPCIPlanner:
                                    for pci, distance, has_mod_conflict, balance_score in compliant_pcis
                                    if not has_mod_conflict]
 
-            if no_mod_conflict_pcis:
-                # 优先使用无模值冲突的PCI
-                final_pcis = no_mod_conflict_pcis
-                print(f"    成功找到{len(final_pcis)}个无同站点模{self.mod_value}冲突的PCI")
-            else:
-                # 关键修复：即使所有PCI都有模3冲突，也要优先选择模3值不同的PCI
-                # 避免同站所有小区模3值相同的情况
-                print(f"    警告：所有满足复用距离的PCI都与同站点存在模{self.mod_value}冲突")
-                print(f"    同站点已有模{self.mod_value}值: {sorted(list(same_site_mods))}")
-
-                # 按模3值分组，优先选择模3值不同的PCI
-                mod_groups = {}
-                for pci_info in compliant_pcis:
-                    pci, distance, has_mod_conflict, balance_score = pci_info
-                    mod_value = pci % self.mod_value
-                    if mod_value not in mod_groups:
-                        mod_groups[mod_value] = []
-                    mod_groups[mod_value].append(pci_info)
-
-                # 关键修复：绝对不允许同站同模，必须选择不同的模3值
-                if len(mod_groups) > 1:
-                    print(f"    发现{len(mod_groups)}个不同的模{self.mod_value}值组，将强制选择不同的模3值")
-
-                    # 获取当前位置已分配PCI的模3值，避免重复选择
-                    same_site_assigned_mods = set()
-                    # 基于经纬度获取同站点已分配的小区PCI模3值
-                    same_site_cells_for_check = self.get_same_site_cells(target_lat, target_lon, exclude_enodeb, exclude_cell)
-                    for cell in same_site_cells_for_check:
-                        if 'pci' in cell and pd.notna(cell['pci']):
-                            same_site_assigned_mods.add(int(cell['pci']) % self.mod_value)
-
-                    # 强制选择未被同基站其他小区使用的模3值
-                    available_mod_groups = {mod: pci_list for mod, pci_list in mod_groups.items()
-                                          if mod not in same_site_assigned_mods}
-
-                    if available_mod_groups:
-                        # 优先选择未被使用的模3值
-                        final_pcis = []
-                        for mod_value, pci_list in available_mod_groups.items():
-                            # 对每个模3组内的PCI进行排序（复用距离优先）
-                            pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
-                            final_pcis.append(pci_list[0])
-                    else:
-                        # 如果所有模3值都被使用，必须选择不同的模3值来避免同站同模
-                        # 选择与已分配模3值不同的模3值
-                        remaining_mod_groups = {mod: pci_list for mod, pci_list in mod_groups.items()}
-                        if len(remaining_mod_groups) > 1:
-                            # 选择与已分配模3值不同的模3值
-                            final_pcis = []
-                            for mod_value, pci_list in remaining_mod_groups.items():
-                                if mod_value not in same_site_assigned_mods:
-                                    pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
-                                    final_pcis.append(pci_list[0])
-                            if not final_pcis:
-                                # 如果无法避免，选择最优的PCI，但记录严重警告
-                                print(f"    严重警告：无法避免同站同模！将选择最优PCI")
-                                final_pcis = []
-                                for mod_value, pci_list in mod_groups.items():
-                                    pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
-                                    final_pcis.append(pci_list[0])
-                        else:
-                            # 如果只有一个模3值，无法避免同站同模
-                            print(f"    严重警告：所有候选PCI模{self.mod_value}值相同，无法避免同站同模！")
-                            # 强制选择不同的PCI，即使模3值相同也要避免同站同模
-                            final_pcis = []
-                            for mod_value, pci_list in mod_groups.items():
-                                pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
-                                final_pcis.append(pci_list[0])
+            # 对于NR网络的双模约束，需要额外检查模3冲突
+            if self.network_type == "NR" and self.dual_mod_requirement:
+                print(f"    NR双模约束：将同时检查模30和模3冲突")
+                
+                # 统计同站点已有的模3值
+                same_site_mod3s = set()
+                same_site_cells_for_check = self.get_same_site_cells(target_lat, target_lon, exclude_enodeb, exclude_cell)
+                for cell in same_site_cells_for_check:
+                    if 'pci' in cell and pd.notna(cell['pci']) and cell['pci'] != -1:
+                        same_site_mod3s.add(int(cell['pci']) % 3)
+                
+                print(f"    同站点已有模3值: {sorted(list(same_site_mod3s))}")
+                
+                # 过滤掉有模3冲突的PCI
+                no_mod3_conflict_pcis = []
+                for pci_info in no_mod_conflict_pcis:
+                    pci = pci_info[0]
+                    mod3_value = pci % 3
+                    if mod3_value not in same_site_mod3s:
+                        no_mod3_conflict_pcis.append(pci_info)
+                
+                if no_mod3_conflict_pcis:
+                    print(f"    成功找到{len(no_mod3_conflict_pcis)}个无模30和模3冲突的PCI")
+                    final_pcis = no_mod3_conflict_pcis
                 else:
-                    # 如果所有PCI模3值都相同，无法避免同站同模
-                    print(f"    严重警告：所有候选PCI模{self.mod_value}值相同，无法避免同站同模！")
-                    # 强制选择不同的PCI，即使模3值相同也要避免同站同模
-                    final_pcis = []
-                    for mod_value, pci_list in mod_groups.items():
-                        pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
-                        final_pcis.append(pci_list[0])
+                    print(f"    警告：所有无模30冲突的PCI都存在模3冲突")
+                    # 如果没有无模3冲突的PCI，使用所有无模30冲突的PCI
+                    final_pcis = no_mod_conflict_pcis
+                    print(f"    使用{len(final_pcis)}个无模30冲突但可能存在模3冲突的PCI")
+            else:
+                 # 非NR双模约束或非NR网络，使用原有逻辑
+                 if no_mod_conflict_pcis:
+                     # 优先使用无模值冲突的PCI
+                     final_pcis = no_mod_conflict_pcis
+                     print(f"    成功找到{len(final_pcis)}个无同站点模{self.mod_value}冲突的PCI")
+                 else:
+                     # 关键修复：即使所有PCI都有模3冲突，也要优先选择模3值不同的PCI
+                     # 避免同站所有小区模3值相同的情况
+                     print(f"    警告：所有满足复用距离的PCI都与同站点存在模{self.mod_value}冲突")
+                     print(f"    同站点已有模{self.mod_value}值: {sorted(list(same_site_mods))}")
+
+                 # 按模3值分组，优先选择模3值不同的PCI
+                 mod_groups = {}
+                 for pci_info in compliant_pcis:
+                     pci, distance, has_mod_conflict, balance_score = pci_info
+                     mod_value = pci % self.mod_value
+                     if mod_value not in mod_groups:
+                         mod_groups[mod_value] = []
+                     mod_groups[mod_value].append(pci_info)
+
+                 # 关键修复：绝对不允许同站同模，必须选择不同的模3值
+                 if len(mod_groups) > 1:
+                     print(f"    发现{len(mod_groups)}个不同的模{self.mod_value}值组，将强制选择不同的模3值")
+
+                     # 获取当前位置已分配PCI的模3值，避免重复选择
+                     same_site_assigned_mods = set()
+                     # 基于经纬度获取同站点已分配的小区PCI模3值
+                     same_site_cells_for_check = self.get_same_site_cells(target_lat, target_lon, exclude_enodeb, exclude_cell)
+                     for cell in same_site_cells_for_check:
+                         if 'pci' in cell and pd.notna(cell['pci']):
+                             same_site_assigned_mods.add(int(cell['pci']) % self.mod_value)
+
+                     # 强制选择未被同基站其他小区使用的模3值
+                     available_mod_groups = {mod: pci_list for mod, pci_list in mod_groups.items()
+                                           if mod not in same_site_assigned_mods}
+
+                     if available_mod_groups:
+                         # 优先选择未被使用的模3值
+                         final_pcis = []
+                         for mod_value, pci_list in available_mod_groups.items():
+                             # 对每个模3组内的PCI进行排序（复用距离优先）
+                             pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
+                             final_pcis.append(pci_list[0])
+                     else:
+                         # 如果所有模3值都被使用，必须选择不同的模3值来避免同站同模
+                         # 选择与已分配模3值不同的模3值
+                         remaining_mod_groups = {mod: pci_list for mod, pci_list in mod_groups.items()}
+                         if len(remaining_mod_groups) > 1:
+                             # 选择与已分配模3值不同的模3值
+                             final_pcis = []
+                             for mod_value, pci_list in remaining_mod_groups.items():
+                                 if mod_value not in same_site_assigned_mods:
+                                     pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
+                                     final_pcis.append(pci_list[0])
+                             if not final_pcis:
+                                 # 如果无法避免，选择最优的PCI，但记录严重警告
+                                 print(f"    严重警告：无法避免同站同模！将选择最优PCI")
+                                 final_pcis = []
+                                 for mod_value, pci_list in mod_groups.items():
+                                     pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
+                                     final_pcis.append(pci_list[0])
+                         else:
+                             # 如果只有一个模3值，无法避免同站同模
+                             print(f"    严重警告：所有候选PCI模{self.mod_value}值相同，无法避免同站同模！")
+                             # 强制选择不同的PCI，即使模3值相同也要避免同站同模
+                             final_pcis = []
+                             for mod_value, pci_list in mod_groups.items():
+                                 pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
+                                 final_pcis.append(pci_list[0])
+                 else:
+                     # 如果所有PCI模3值都相同，无法避免同站同模
+                     print(f"    严重警告：所有候选PCI模{self.mod_value}值相同，无法避免同站同模！")
+                     # 强制选择不同的PCI，即使模3值相同也要避免同站同模
+                     final_pcis = []
+                     for mod_value, pci_list in mod_groups.items():
+                         pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
+                         final_pcis.append(pci_list[0])
         
         # 多重优先级排序策略 - 修正优先级顺序
         def sort_key(pci_info):
