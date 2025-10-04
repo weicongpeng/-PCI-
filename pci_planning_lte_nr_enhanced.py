@@ -1918,13 +1918,48 @@ class LTENRPCIPlanner:
         else:
             # LTE网络直接使用get_reuse_compliant_pcis返回的结果，不进行额外处理
             print(f"  LTE网络：使用get_reuse_compliant_pcis的完整结果，共{len(compliant_pcis)}个候选PCI")
+            
+            # 对于LTE网络，如果候选PCI数量较少但大于0，直接使用所有候选
+            if len(compliant_pcis) > 0 and len(compliant_pcis) <= 10:
+                print(f"  候选PCI数量较少({len(compliant_pcis)})，直接使用所有候选确保同站模3错开")
         
         if not compliant_pcis:
-            # 根据新的优先级策略：复用距离 > 分配成功率 > PCI不冲突 > 模3不相同
-            # 当无法找到满足复用距离的PCI时，使用保底方案确保分配成功率
-            self.failure_reasons['no_compliant_pci'].append(f"{enodeb_id}-{cell_id}")
-            fallback_pci = enodeb_id % len(self.pci_range)
-            return fallback_pci, 'no_compliant_pci_fallback', earfcn_dl, 0.0
+            # 智能降级策略：当无法找到满足复用距离的PCI时，逐步放宽要求
+            print(f"  警告：无法找到满足{self.reuse_distance_km}km复用距离的PCI，尝试智能降级")
+            
+            # 第一步：尝试放宽到3.0km（中等距离要求）
+            original_distance = self.reuse_distance_km
+            self.reuse_distance_km = 3.0
+            compliant_pcis = self.get_reuse_compliant_pcis(
+                target_lat, target_lon, earfcn_dl, enodeb_id, cell_id, target_mod
+            )
+            
+            if not compliant_pcis:
+                # 第二步：尝试放宽到2.0km（较低距离要求）
+                self.reuse_distance_km = 2.0
+                compliant_pcis = self.get_reuse_compliant_pcis(
+                    target_lat, target_lon, earfcn_dl, enodeb_id, cell_id, target_mod
+                )
+            
+            # 恢复原距离要求
+            self.reuse_distance_km = original_distance
+            
+            if compliant_pcis:
+                print(f"  智能降级成功：找到{len(compliant_pcis)}个候选PCI")
+                # 使用降级后的候选PCI继续规划
+                best_pci_info = compliant_pcis[0]
+                best_pci = best_pci_info[0]
+                min_distance = best_pci_info[1]
+                
+                # 确定分配原因
+                reason = f'no_compliant_pci_fallback_downgrade_{self.reuse_distance_km}km_to_{min(3.0, 2.0)}km'
+                
+                return best_pci, reason, earfcn_dl, min_distance
+            else:
+                # 如果降级后仍然找不到，使用保底方案
+                self.failure_reasons['no_compliant_pci'].append(f"{enodeb_id}-{cell_id}")
+                fallback_pci = enodeb_id % len(self.pci_range)
+                return fallback_pci, 'no_compliant_pci_fallback', earfcn_dl, 0.0
         
         # 选择最优的PCI（经过多重优先级排序后的第一个）
         best_pci_info = compliant_pcis[0]
