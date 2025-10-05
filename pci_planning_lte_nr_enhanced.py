@@ -1383,10 +1383,22 @@ class LTENRPCIPlanner:
             same_freq_same_pci_cells['lat'].values,
             same_freq_same_pci_cells['lon'].values
         )
-        
+
         min_distance = np.min(distances)
+
+        # 检查是否有同站点PCI冲突（最高优先级）
+        # 同站点小区不能使用相同的PCI，即使距离满足要求
+        same_site_cells = self.get_same_site_cells(target_lat, target_lon, exclude_enodeb, exclude_cell)
+        for same_site_cell in same_site_cells:
+            same_site_pci = same_site_cell.get('pci')
+            if pd.notna(same_site_pci) and same_site_pci == candidate_pci:
+                # 发现同站点PCI冲突，直接返回无效
+                result = (False, 0.0)  # 距离设为0表示同站冲突
+                self.pci_validity_cache[cache_key] = result
+                return result
+
         is_valid = min_distance >= self.reuse_distance_km
-        
+
         result = (is_valid, min_distance)
         self.pci_validity_cache[cache_key] = result
         return result
@@ -1881,7 +1893,7 @@ class LTENRPCIPlanner:
                          pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
                          final_pcis.append(pci_list[0])
         
-        # 多重优先级排序策略 - 修正优先级顺序
+        # 多重优先级排序策略 - 修正优先级顺序，添加连续PCI分配优化
         def sort_key(pci_info):
             pci, distance, has_mod_conflict, balance_score = pci_info
 
@@ -1911,17 +1923,28 @@ class LTENRPCIPlanner:
                 # 不满足复用距离的PCI，距离大的优先
                 distance_priority = -distance
 
-            # 优先级5：PCI值（第五优先级）- 小的优先，确保确定性
+            # 优先级5：连续PCI分配优化（第五优先级）- 优先选择能与同站点已分配PCI形成连续序列的PCI
+            # 获取同站点已分配的PCI值
+            same_site_assigned_pcis = self.get_same_site_assigned_pcis(target_lat, target_lon, exclude_enodeb, exclude_cell)
+            continuity_priority = self.calculate_pci_continuity_score(pci, same_site_assigned_pcis)
+
+            # 优先级6：PCI值（第六优先级）- 小的优先，确保确定性
             pci_priority = pci
 
-            return (mod_conflict_priority, distance_compliance, balance_priority, distance_priority, pci_priority)
+            return (mod_conflict_priority, distance_compliance, balance_priority,
+                   distance_priority, continuity_priority, pci_priority)
         
         final_pcis.sort(key=sort_key)
         
         # 输出排序结果用于调试
         if len(final_pcis) > 0:
             top_candidates = final_pcis[:min(5, len(final_pcis))]
-            print(f"    前{len(top_candidates)}个候选PCI排序结果 (优先选择满足复用距离且接近阈值的PCI):")
+            print(f"    前{len(top_candidates)}个候选PCI排序结果 (优先级：复用距离>模值冲突>均衡性>距离>连续性>PCI值):")
+
+            # 获取同站点已分配PCI用于连续性分析
+            same_site_assigned_pcis = self.get_same_site_assigned_pcis(target_lat, target_lon, exclude_enodeb, exclude_cell)
+            print(f"    同站点已分配PCI: {same_site_assigned_pcis}")
+
             for i, (pci, dist, conflict, _) in enumerate(top_candidates):
                 status = "无冲突" if not conflict else "有冲突"
                 if dist == float('inf'):
@@ -1932,11 +1955,85 @@ class LTENRPCIPlanner:
                         dist_str += f"(满足≥{self.reuse_distance_km}km)"
                     else:
                         dist_str += f"(不满足<{self.reuse_distance_km}km)"
-                print(f"      {i+1}. PCI={pci} (mod{self.mod_value}={pci%self.mod_value}), 距离={dist_str}, {status}")
+
+                # 计算连续性得分和描述
+                continuity_score = self.calculate_pci_continuity_score(pci, same_site_assigned_pcis)
+                if continuity_score == 0:
+                    continuity_str = "连续"
+                elif continuity_score == 1:
+                    continuity_str = "接近连续"
+                else:
+                    continuity_str = "不连续"
+
+                print(f"      {i+1}. PCI={pci:3d} (mod{self.mod_value}={pci%self.mod_value}), 距离={dist_str:>12}, {status:>6}, 连续性={continuity_str}")
         
         # 保持4元组格式以确保数据结构一致性
         return final_pcis
-    
+
+    def get_same_site_assigned_pcis(self, target_lat: float, target_lon: float,
+                                   exclude_enodeb: int = None, exclude_cell: int = None) -> List[int]:
+        """
+        获取同站点已分配的PCI值列表
+
+        Args:
+            target_lat: 目标小区纬度
+            target_lon: 目标小区经度
+            exclude_enodeb: 要排除的基站ID
+            exclude_cell: 要排除的小区ID
+
+        Returns:
+            List[int]: 同站点已分配的PCI值列表
+        """
+        same_site_cells = self.get_same_site_cells(target_lat, target_lon, exclude_enodeb, exclude_cell)
+        assigned_pcis = []
+
+        for cell in same_site_cells:
+            pci_value = cell.get('pci')
+            if pd.notna(pci_value) and pci_value != -1:
+                assigned_pcis.append(int(pci_value))
+
+        return sorted(assigned_pcis)
+
+    def calculate_pci_continuity_score(self, candidate_pci: int, same_site_assigned_pcis: List[int]) -> int:
+        """
+        计算候选PCI的连续性得分
+
+        Args:
+            candidate_pci: 候选PCI值
+            same_site_assigned_pcis: 同站点已分配的PCI值列表
+
+        Returns:
+            int: 连续性得分（越小越好，0表示完全不连续，1表示能形成连续序列）
+        """
+        if not same_site_assigned_pcis:
+            # 同站点没有已分配的PCI，无法形成连续序列
+            return 1
+
+        # 检查是否能与已分配PCI形成连续序列
+        # 连续序列是指相邻的PCI值（如 1,2,3 或 10,11,12）
+        assigned_set = set(same_site_assigned_pcis)
+
+        # 检查候选PCI是否能扩展现有连续序列
+        # 例如：已分配 [10,11]，候选PCI=9或12可以形成连续序列
+        for assigned_pci in same_site_assigned_pcis:
+            if candidate_pci == assigned_pci - 1:  # 候选PCI在序列前面
+                return 0  # 优先级最高
+            elif candidate_pci == assigned_pci + 1:  # 候选PCI在序列后面
+                return 0  # 优先级最高
+
+        # 检查是否能与任意一个已分配PCI形成连续对（即使不是完整序列）
+        for assigned_pci in same_site_assigned_pcis:
+            if abs(candidate_pci - assigned_pci) == 1:
+                return 0  # 优先级最高
+
+        # 检查是否能形成接近连续的序列（相差2）
+        for assigned_pci in same_site_assigned_pcis:
+            if abs(candidate_pci - assigned_pci) == 2:
+                return 1  # 优先级较高
+
+        # 无法形成任何连续性
+        return 2
+
     def assign_pci_with_reuse_priority(self, enodeb_id: int, cell_id: int) -> Tuple[Optional[int], str, float, float]:
         """
         优先确保复用距离的PCI分配方法
@@ -2155,9 +2252,9 @@ class LTENRPCIPlanner:
         
         # 同时更新合并数据
         if self.all_cells_combined is not None:
-            combined_mask = ((self.all_cells_combined['enodeb_id'] == enodeb_id) & 
-                           (self.all_cells_combined['cell_id'] == cell_id) & 
-                           (self.all_cells_combined['cell_type'] == self.network_type))
+            combined_mask = ((self.all_cells_combined['enodeb_id'] == enodeb_id) &
+                           (self.all_cells_combined['cell_id'] == cell_id))
+            # 移除cell_type过滤条件，确保所有类型的小区都能更新
             self.all_cells_combined.loc[combined_mask, 'pci'] = assigned_pci
         
         # 彻底清除所有相关缓存（关键修复）
