@@ -1352,13 +1352,14 @@ class LTENRPCIPlanner:
         if cache_key in self.pci_validity_cache:
             return self.pci_validity_cache[cache_key]
         
-        # 只查找同频同PCI的小区，并且只考虑同网络类型
-        same_freq_same_pci_cells = self.target_cells[
-            (self.target_cells['pci'] == candidate_pci) &
-            (self.target_cells['pci'].notna()) &
-            (self.target_cells['earfcn_dl'] == target_earfcn) &  # 同频条件
-            (self.target_cells['earfcn_dl'].notna()) &
-            (self.target_cells['cell_type'] == self.network_type)  # 同网络类型
+        # 只查找同频同PCI的小区
+        # 修复：应该从 all_cells_combined 中查找，因为包含所有已分配PCI的小区
+        # 移除cell_type过滤条件，因为在实际使用中cell_type值可能不一致
+        same_freq_same_pci_cells = self.all_cells_combined[
+            (self.all_cells_combined['pci'] == candidate_pci) &
+            (self.all_cells_combined['pci'].notna()) &
+            (self.all_cells_combined['earfcn_dl'] == target_earfcn) &  # 同频条件
+            (self.all_cells_combined['earfcn_dl'].notna())
         ].copy()
         
         # 排除当前小区自己
@@ -1883,42 +1884,55 @@ class LTENRPCIPlanner:
         # 多重优先级排序策略 - 修正优先级顺序
         def sort_key(pci_info):
             pci, distance, has_mod_conflict, balance_score = pci_info
-            
+
             # 优先级1：同站点模值冲突（最高优先级）- 绝对不允许同站同模
             mod_conflict_priority = 0 if not has_mod_conflict else 1
-            
+
             # 优先级2：复用距离合规性（第二优先级）- 必须满足用户设定的最小复用距离
-            # 关键修复：优先选择满足复用距离要求的PCI
-            if distance == float('inf'):
-                distance_compliance = 0  # 无复用PCI最优
-            elif distance >= self.reuse_distance_km:
+            # 关键修复：只要满足复用距离要求即可，不需要优先选择"无复用PCI"
+            if distance >= self.reuse_distance_km:
                 distance_compliance = 0  # 满足复用距离要求
             else:
                 distance_compliance = 1  # 不满足复用距离要求
-            
-            # 优先级3：复用距离大小（第三优先级）- 距离越大越安全
-            if distance == float('inf'):
-                distance_priority = -999999  # 无复用PCI最优
+
+            # 优先级3：PCI分布均衡性（第三优先级）- 越接近阈值越好，避免选择过远距离的PCI
+            if distance >= self.reuse_distance_km:
+                # 对于满足复用距离要求的PCI，选择距离接近阈值的
+                balance_priority = abs(distance - self.reuse_distance_km)
             else:
-                distance_priority = -distance  # 距离大的优先
-            
-            # 优先级4：PCI分布均衡性（第四优先级）- 越接近阈值越好
-            balance_priority = balance_score
-            
+                # 对于不满足复用距离要求的PCI，给予惩罚
+                balance_priority = 999999 + abs(distance - self.reuse_distance_km)
+
+            # 优先级4：复用距离大小（第四优先级）- 在满足条件下适当考虑距离，但不作为主要因素
+            if distance >= self.reuse_distance_km:
+                # 在满足复用距离的条件下，略微偏向距离较大的，但权重很低
+                distance_priority = -distance * 0.1  # 降低距离权重
+            else:
+                # 不满足复用距离的PCI，距离大的优先
+                distance_priority = -distance
+
             # 优先级5：PCI值（第五优先级）- 小的优先，确保确定性
             pci_priority = pci
-            
-            return (mod_conflict_priority, distance_compliance, distance_priority, balance_priority, pci_priority)
+
+            return (mod_conflict_priority, distance_compliance, balance_priority, distance_priority, pci_priority)
         
         final_pcis.sort(key=sort_key)
         
         # 输出排序结果用于调试
         if len(final_pcis) > 0:
             top_candidates = final_pcis[:min(5, len(final_pcis))]
-            print(f"    前{len(top_candidates)}个候选PCI排序结果:")
+            print(f"    前{len(top_candidates)}个候选PCI排序结果 (优先选择满足复用距离且接近阈值的PCI):")
             for i, (pci, dist, conflict, _) in enumerate(top_candidates):
                 status = "无冲突" if not conflict else "有冲突"
-                print(f"      {i+1}. PCI={pci} (mod{self.mod_value}={pci%self.mod_value}), 距离={dist:.2f}km, {status}")
+                if dist == float('inf'):
+                    dist_str = "无复用PCI"
+                else:
+                    dist_str = f"{dist:.2f}km"
+                    if dist >= self.reuse_distance_km:
+                        dist_str += f"(满足≥{self.reuse_distance_km}km)"
+                    else:
+                        dist_str += f"(不满足<{self.reuse_distance_km}km)"
+                print(f"      {i+1}. PCI={pci} (mod{self.mod_value}={pci%self.mod_value}), 距离={dist_str}, {status}")
         
         # 保持4元组格式以确保数据结构一致性
         return final_pcis
