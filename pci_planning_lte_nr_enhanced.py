@@ -1429,16 +1429,16 @@ class LTENRPCIPlanner:
                   (same_site_cells['cell_id'] == exclude_cell_id))
             ]
         
-        # 只返回当前网络类型的小区
-        same_site_cells = same_site_cells[
-            same_site_cells['cell_type'] == self.network_type
-        ]
-        
+        # 关键修复：移除cell_type过滤条件，因为cell_type值可能不一致
+        # 在测试和实际数据中，目标小区的cell_type可能是"target"，而现有小区可能是"NR"或其他值
+        # 为了正确识别同站小区，应该基于位置和基站ID判断，而不是cell_type
+        # 保留所有同位置的小区，无论cell_type如何
+
         # 确保获取到最新的PCI分配信息
         result = same_site_cells.to_dict('records')
         
         # 调试信息：显示同站点小区的PCI分配情况
-        if result:
+        if result and False:  # 关闭调试信息
             print(f"      [DEBUG] 位置({target_lat:.6f}, {target_lon:.6f})同站点小区PCI分配情况:")
             for cell in result:
                 enodeb_id = cell.get('enodeb_id', 'N/A')
@@ -1487,10 +1487,8 @@ class LTENRPCIPlanner:
                 same_location_cells['cell_id'] != exclude_cell_id
             ]
         
-        # 关键修改：只返回当前网络类型的小区，确保与get_same_site_cells函数逻辑一致
-        same_location_cells = same_location_cells[
-            same_location_cells['cell_type'] == self.network_type
-        ]
+        # 移除cell_type过滤条件，因为cell_type值可能不一致（如"target" vs "NR"）
+        # 保留所有同位置的小区，无论cell_type如何
         
         return same_location_cells.to_dict('records')
     
@@ -1544,33 +1542,28 @@ class LTENRPCIPlanner:
 
         # 对于NR网络，需要同时检查模3和模30冲突
         if self.network_type == "NR" and self.dual_mod_requirement:
-            # 检查模3冲突
+            # 检查模3冲突（NR网络的最高优先级）
             candidate_mod3 = candidate_pci % 3
             existing_mod3s = []
             mod3_conflict_cells = []
-            
+
             for cell in same_site_cells:
                 existing_pci = cell['pci']
                 if pd.notna(existing_pci) and existing_pci != -1:
                     existing_mod3 = int(existing_pci) % 3
                     existing_mod3s.append(existing_mod3)
+                    # NR网络绝对不允许同站同模3，即使没有达到3个小区也要避免
                     if existing_mod3 == candidate_mod3:
                         enodeb_id = cell.get('enodeb_id', 'N/A')
                         cell_id = cell.get('cell_id', 'N/A')
                         mod3_conflict_cells.append(f"基站{enodeb_id}-小区{cell_id}(PCI{existing_pci})")
-            
-            # 检查同站点是否已有3个不同模3值
-            unique_mod3s = set(existing_mod3s)
-            if len(unique_mod3s) >= 3 and candidate_mod3 in unique_mod3s:
-                print(f"      [DEBUG] 发现NR同站点模3冲突: 候选PCI={candidate_pci} (mod3={candidate_mod3})")
-                print(f"      [DEBUG] 同站点已有模3值: {sorted(existing_mod3s)} (已达3种不同值)")
-                return False
-            
-            # 检查模3冲突
+                        print(f"      [严重警告] NR同站模3冲突: 候选PCI={candidate_pci} (mod3={candidate_mod3})")
+                        print(f"      [严重警告] 冲突小区: 基站{enodeb_id}-小区{cell_id} (PCI={existing_pci}, mod3={existing_mod3})")
+                        return False  # 直接返回，不允许模3冲突
+
+            # 如果发现任何模3冲突，直接返回False
             if mod3_conflict_cells:
-                print(f"      [DEBUG] 发现NR同站点模3冲突: 候选PCI={candidate_pci} (mod3={candidate_mod3})")
-                print(f"      [DEBUG] 模3冲突小区: {', '.join(mod3_conflict_cells)}")
-                print(f"      [DEBUG] 同站点已有模3值: {sorted(existing_mod3s)}")
+                print(f"      [严重警告] NR同站点已有模3值: {sorted(existing_mod3s)}，候选PCI模3={candidate_mod3}冲突")
                 return False
 
         # 如果发现冲突，记录详细信息
@@ -1666,16 +1659,39 @@ class LTENRPCIPlanner:
             # 2. 检查同站点模值冲突（第二优先级）
             candidate_mod = pci % self.mod_value
             has_same_site_mod_conflict = candidate_mod in same_site_mods
+
+            # 对于NR网络，额外检查模3冲突（最高优先级）
+            has_nr_mod3_conflict = False
+            if self.network_type == "NR" and self.dual_mod_requirement:
+                # 调用专门的模3冲突检查函数
+                no_conflict = self.check_same_site_mod_conflict(
+                    pci, target_lat, target_lon, exclude_enodeb, exclude_cell
+                )
+                has_nr_mod3_conflict = not no_conflict
+
+                # 调试信息
+                if has_nr_mod3_conflict:
+                    # print(f"      [关键调试] NR候选PCI={pci} (mod3={pci%3}) 检测到同站模3冲突，执行continue跳过")
+                    continue  # NR网络模3冲突直接跳过，不进入候选列表
+                else:
+                    # print(f"      [关键调试] NR候选PCI={pci} (mod3={pci%3}) 无同站模3冲突，可以接受")
+                    pass
             
             # 3. 计算PCI分布均衡性指标（第三优先级）
             # 距离越接近阈值越均衡
             if min_distance == float('inf'):
                 balance_score = 0  # 无复用PCI，最均衡
             else:
-                # 距离接近阈值的得分更高（分数越小越好）
+                # 距离接近阈值得分更高（分数越小越好）
                 balance_score = abs(min_distance - self.reuse_distance_km)
-            
-            compliant_pcis.append((pci, min_distance, has_same_site_mod_conflict, balance_score))
+
+            # 关键修复：对于NR网络，需要考虑模3冲突状态
+            # 统一冲突标志：mod30冲突或NR模3冲突任一为真都表示有冲突
+            has_any_conflict = has_same_site_mod_conflict
+            if self.network_type == "NR" and self.dual_mod_requirement:
+                has_any_conflict = has_any_conflict or has_nr_mod3_conflict
+
+            compliant_pcis.append((pci, min_distance, has_any_conflict, balance_score))
         
         if not compliant_pcis:
             return []
@@ -1893,21 +1909,38 @@ class LTENRPCIPlanner:
                          pci_list.sort(key=lambda x: (-x[1], x[3], x[0]))
                          final_pcis.append(pci_list[0])
         
-        # 多重优先级排序策略 - 修正优先级顺序，添加连续PCI分配优化
+        # 多重优先级排序策略 - 修正优先级顺序，强化NR网络同站模3错开
         def sort_key(pci_info):
             pci, distance, has_mod_conflict, balance_score = pci_info
 
-            # 优先级1：同站点模值冲突（最高优先级）- 绝对不允许同站同模
-            mod_conflict_priority = 0 if not has_mod_conflict else 1
+            # 对于NR网络，需要检查同站模3冲突（最高优先级）
+            mod3_conflict_priority = 0
+            if self.network_type == "NR" and self.dual_mod_requirement:
+                # 获取同站点已有的模3值
+                same_site_mod3s = set()
+                same_site_cells_for_check = self.get_same_site_cells(target_lat, target_lon, exclude_enodeb, exclude_cell)
+                for cell in same_site_cells_for_check:
+                    if 'pci' in cell and pd.notna(cell['pci']) and cell['pci'] != -1:
+                        same_site_mod3s.add(int(cell['pci']) % 3)
 
-            # 优先级2：复用距离合规性（第二优先级）- 必须满足用户设定的最小复用距离
-            # 关键修复：只要满足复用距离要求即可，不需要优先选择"无复用PCI"
+                candidate_mod3 = pci % 3
+                # 同站模3冲突具有最高优先级，必须避免
+                mod3_conflict_priority = 0 if candidate_mod3 not in same_site_mod3s else 1
+
+                # 调试信息
+                if mod3_conflict_priority == 1:
+                    print(f"      [NR模3冲突] PCI={pci} (mod3={candidate_mod3}) 与同站模3值冲突: {sorted(list(same_site_mod3s))}")
+
+            # 优先级1（LTE）/ 优先级2（NR）：同站点模值冲突（mod30）- 避免同站同mod30
+            mod30_conflict_priority = 0 if not has_mod_conflict else 1
+
+            # 优先级2（LTE）/ 优先级3（NR）：复用距离合规性 - 必须满足用户设定的最小复用距离
             if distance >= self.reuse_distance_km:
                 distance_compliance = 0  # 满足复用距离要求
             else:
                 distance_compliance = 1  # 不满足复用距离要求
 
-            # 优先级3：PCI分布均衡性（第三优先级）- 越接近阈值越好，避免选择过远距离的PCI
+            # 优先级3（LTE）/ 优先级4（NR）：PCI分布均衡性 - 越接近阈值越好，避免选择过远距离的PCI
             if distance >= self.reuse_distance_km:
                 # 对于满足复用距离要求的PCI，选择距离接近阈值的
                 balance_priority = abs(distance - self.reuse_distance_km)
@@ -1915,7 +1948,7 @@ class LTENRPCIPlanner:
                 # 对于不满足复用距离要求的PCI，给予惩罚
                 balance_priority = 999999 + abs(distance - self.reuse_distance_km)
 
-            # 优先级4：复用距离大小（第四优先级）- 在满足条件下适当考虑距离，但不作为主要因素
+            # 优先级4（LTE）/ 优先级5（NR）：复用距离大小 - 在满足条件下适当考虑距离，但不作为主要因素
             if distance >= self.reuse_distance_km:
                 # 在满足复用距离的条件下，略微偏向距离较大的，但权重很低
                 distance_priority = -distance * 0.1  # 降低距离权重
@@ -1923,27 +1956,47 @@ class LTENRPCIPlanner:
                 # 不满足复用距离的PCI，距离大的优先
                 distance_priority = -distance
 
-            # 优先级5：连续PCI分配优化（第五优先级）- 优先选择能与同站点已分配PCI形成连续序列的PCI
+            # 优先级5（LTE）/ 优先级6（NR）：连续PCI分配优化 - 优先选择能与同站点已分配PCI形成连续序列的PCI
             # 获取同站点已分配的PCI值
             same_site_assigned_pcis = self.get_same_site_assigned_pcis(target_lat, target_lon, exclude_enodeb, exclude_cell)
             continuity_priority = self.calculate_pci_continuity_score(pci, same_site_assigned_pcis)
 
-            # 优先级6：PCI值（第六优先级）- 小的优先，确保确定性
+            # 优先级6（LTE）/ 优先级7（NR）：PCI值 - 小的优先，确保确定性
             pci_priority = pci
 
-            return (mod_conflict_priority, distance_compliance, balance_priority,
-                   distance_priority, continuity_priority, pci_priority)
+            # 根据网络类型返回不同的优先级元组
+            if self.network_type == "NR" and self.dual_mod_requirement:
+                # NR网络：模3冲突 > mod30冲突 > 复用距离 > 均衡性 > 距离 > 连续性 > PCI值
+                return (mod3_conflict_priority, mod30_conflict_priority, distance_compliance,
+                       balance_priority, distance_priority, continuity_priority, pci_priority)
+            else:
+                # LTE网络：mod30冲突 > 复用距离 > 均衡性 > 距离 > 连续性 > PCI值
+                return (mod30_conflict_priority, distance_compliance, balance_priority,
+                       distance_priority, continuity_priority, pci_priority)
         
         final_pcis.sort(key=sort_key)
         
         # 输出排序结果用于调试
         if len(final_pcis) > 0:
             top_candidates = final_pcis[:min(5, len(final_pcis))]
-            print(f"    前{len(top_candidates)}个候选PCI排序结果 (优先级：复用距离>模值冲突>均衡性>距离>连续性>PCI值):")
+
+            # 根据网络类型显示不同的优先级信息
+            if self.network_type == "NR" and self.dual_mod_requirement:
+                print(f"    前{len(top_candidates)}个候选PCI排序结果 (NR优先级：模3冲突>mod30冲突>复用距离>均衡性>距离>连续性>PCI值):")
+            else:
+                print(f"    前{len(top_candidates)}个候选PCI排序结果 (LTE优先级：mod30冲突>复用距离>均衡性>距离>连续性>PCI值):")
 
             # 获取同站点已分配PCI用于连续性分析
             same_site_assigned_pcis = self.get_same_site_assigned_pcis(target_lat, target_lon, exclude_enodeb, exclude_cell)
-            print(f"    同站点已分配PCI: {same_site_assigned_pcis}")
+
+            # 对于NR网络，显示模3信息
+            if self.network_type == "NR" and self.dual_mod_requirement:
+                same_site_mod3s = set()
+                for assigned_pci in same_site_assigned_pcis:
+                    same_site_mod3s.add(assigned_pci % 3)
+                print(f"    同站点已分配PCI: {same_site_assigned_pcis}, 模3值: {sorted(list(same_site_mod3s))}")
+            else:
+                print(f"    同站点已分配PCI: {same_site_assigned_pcis}")
 
             for i, (pci, dist, conflict, _) in enumerate(top_candidates):
                 status = "无冲突" if not conflict else "有冲突"
@@ -1965,7 +2018,13 @@ class LTENRPCIPlanner:
                 else:
                     continuity_str = "不连续"
 
-                print(f"      {i+1}. PCI={pci:3d} (mod{self.mod_value}={pci%self.mod_value}), 距离={dist_str:>12}, {status:>6}, 连续性={continuity_str}")
+                # 对于NR网络，添加模3冲突检查
+                if self.network_type == "NR" and self.dual_mod_requirement:
+                    mod3_conflict = pci % 3 in same_site_mod3s if same_site_mod3s else False
+                    mod3_status = "模3冲突" if mod3_conflict else "模3正常"
+                    print(f"      {i+1}. PCI={pci:3d} (mod3={pci%3}, mod30={pci%self.mod_value}), 距离={dist_str:>12}, {status:>6}, {mod3_status:>8}, 连续性={continuity_str}")
+                else:
+                    print(f"      {i+1}. PCI={pci:3d} (mod{self.mod_value}={pci%self.mod_value}), 距离={dist_str:>12}, {status:>6}, 连续性={continuity_str}")
         
         # 保持4元组格式以确保数据结构一致性
         return final_pcis
@@ -2033,6 +2092,190 @@ class LTENRPCIPlanner:
 
         # 无法形成任何连续性
         return 2
+
+    def calculate_fallback_pci(self, enodeb_id: int, cell_id: int, lat: float, lon: float) -> int:
+        """
+        计算保底PCI，避免同站同PCI冲突和模3冲突
+
+        Args:
+            enodeb_id: 基站ID
+            cell_id: 小区ID
+            lat: 纬度
+            lon: 经度
+
+        Returns:
+            计算出的PCI值
+        """
+        # 获取同站点已分配的PCI
+        same_site_assigned_pcis = self.get_same_site_assigned_pcis(lat, lon, enodeb_id, cell_id)
+        used_pcis = set(same_site_assigned_pcis)
+
+        # 基础PCI：使用基站ID和小区ID的组合
+        base_pci = (enodeb_id * 100 + cell_id) % len(self.pci_range)
+
+        # 对于NR网络，需要确保模3错开
+        if self.network_type == "NR" and self.dual_mod_requirement:
+            # 获取同站小区的模3值
+            used_mod3s = set()
+            for pci in used_pcis:
+                if pd.notna(pci) and pci != -1:
+                    used_mod3s.add(int(pci) % 3)
+
+            # 尝试找到一个未被占用的模3值
+            for mod3 in range(3):
+                if mod3 not in used_mod3s:
+                    # 计算符合该模3值的最小PCI
+                    for offset in range(0, 100):  # 最多尝试100个偏移
+                        candidate_pci = (base_pci + offset) % len(self.pci_range)
+                        if candidate_pci % 3 == mod3 and candidate_pci not in used_pcis:
+                            return candidate_pci
+
+            # 如果所有模3值都被占用，选择任意未使用的PCI
+            for offset in range(0, 100):
+                candidate_pci = (base_pci + offset) % len(self.pci_range)
+                if candidate_pci not in used_pcis:
+                    return candidate_pci
+        else:
+            # LTE网络：简单避免同站同PCI
+            for offset in range(0, 100):
+                candidate_pci = (base_pci + offset) % len(self.pci_range)
+                if candidate_pci not in used_pcis:
+                    return candidate_pci
+
+        # 如果仍然找不到，返回基础PCI（极少数情况）
+        return base_pci
+
+    def validate_fallback_pci_meets_constraints(self, pci: int, lat: float, lon: float,
+                                              earfcn_dl: float, enodeb_id: int, cell_id: int) -> bool:
+        """
+        验证降级或保底PCI是否满足原始约束条件
+
+        关键修复：验证的是待分配PCI是否满足原始复用距离要求，而不是检查冲突
+
+        Args:
+            pci: 要验证的PCI值
+            lat: 纬度
+            lon: 经度
+            earfcn_dl: 下行频点
+            enodeb_id: 基站ID
+            cell_id: 小区ID
+
+        Returns:
+            bool: 是否满足约束条件
+        """
+        # 1. 检查复用距离约束
+        # 暂时保存原始复用距离
+        original_distance = self.reuse_distance_km
+
+        try:
+            print(f"    [验证开始] PCI={pci}, 原始复用距离={original_distance}km")
+
+            # 2. 检查是否存在同频复用距离冲突（排除自身小区）
+            reuse_conflicts = 0
+            for _, existing_cell in self.all_cells_combined.iterrows():
+                # 排除自身小区（基于基站ID和小区ID）
+                if (existing_cell['enodeb_id'] == enodeb_id and
+                    existing_cell['cell_id'] == cell_id):
+                    continue
+
+                # 只检查已分配的PCI（排除未分配的PCI=0）
+                if (existing_cell['pci'] == pci and
+                    existing_cell['earfcn_dl'] == earfcn_dl and
+                    pd.notna(existing_cell['pci']) and existing_cell['pci'] != 0):
+
+                    # 计算距离
+                    distance = self.calculate_distance(lat, lon, existing_cell['lat'], existing_cell['lon'])
+                    print(f"    [检查] 同频PCI={pci}, 距离={distance:.2f}km")
+
+                    # 检查是否违反复用距离（距离小于最小复用距离且大于0）
+                    if 0 < distance < original_distance:
+                        reuse_conflicts += 1
+                        print(f"    [验证失败] 复用距离冲突: PCI={pci}, 距离={distance:.2f}km < {original_distance}km")
+                        return False
+
+            print(f"    [检查完成] 复用距离检查通过，无冲突")
+
+            # 3. 检查NR网络模3和模30约束
+            if self.network_type == "NR" and self.dual_mod_requirement:
+                # 检查模3冲突（关键修复：临时分配PCI进行检查，然后撤销）
+                temp_assigned = self.get_temp_assignment_for_validation(enodeb_id, cell_id, pci)
+
+                try:
+                    # 临时更新数据以进行验证
+                    temp_cell_mask = (self.all_cells_combined['enodeb_id'] == enodeb_id) & \
+                                    (self.all_cells_combined['cell_id'] == cell_id)
+                    original_pci = self.all_cells_combined.loc[temp_cell_mask, 'pci'].values[0] if temp_cell_mask.any() else 0
+                    self.all_cells_combined.loc[temp_cell_mask, 'pci'] = pci
+
+                    # 检查模3冲突
+                    if not self.check_same_site_mod_conflict(pci, lat, lon, enodeb_id, cell_id):
+                        print(f"    [验证失败] NR同站模3冲突: PCI={pci} (mod3={pci%3})")
+                        return False
+                    print(f"    [检查通过] NR模3约束")
+
+                    # 检查模30冲突（只检查同站其他小区）
+                    for _, existing_cell in self.all_cells_combined.iterrows():
+                        # 只检查同站的其他已分配小区
+                        if (existing_cell['enodeb_id'] == enodeb_id and
+                            existing_cell['cell_id'] != cell_id and
+                            existing_cell['earfcn_dl'] == earfcn_dl and
+                            pd.notna(existing_cell['pci']) and existing_cell['pci'] != 0):
+
+                            distance = self.calculate_distance(lat, lon, existing_cell['lat'], existing_cell['lon'])
+                            if distance < 0.01:  # 同站判断距离阈值
+                                if pci % 30 == existing_cell['pci'] % 30:
+                                    print(f"    [验证失败] NR同站模30冲突: PCI={pci} (mod30={pci%30}) vs 现有PCI={existing_cell['pci']} (mod30={existing_cell['pci']%30})")
+                                    return False
+
+                    print(f"    [检查通过] NR模30约束")
+
+                finally:
+                    # 恢复原始PCI值
+                    self.all_cells_combined.loc[temp_cell_mask, 'pci'] = original_pci
+
+            # 4. 检查LTE网络模3约束
+            elif self.network_type == "LTE":
+                # LTE模3约束检查（同样使用临时分配机制）
+                temp_cell_mask = (self.all_cells_combined['enodeb_id'] == enodeb_id) & \
+                                (self.all_cells_combined['cell_id'] == cell_id)
+                original_pci = self.all_cells_combined.loc[temp_cell_mask, 'pci'].values[0] if temp_cell_mask.any() else 0
+                self.all_cells_combined.loc[temp_cell_mask, 'pci'] = pci
+
+                try:
+                    # LTE模3约束检查
+                    for _, existing_cell in self.all_cells_combined.iterrows():
+                        # 只检查同站的其他已分配小区
+                        if (existing_cell['enodeb_id'] == enodeb_id and
+                            existing_cell['cell_id'] != cell_id and
+                            existing_cell['earfcn_dl'] == earfcn_dl and
+                            pd.notna(existing_cell['pci']) and existing_cell['pci'] != 0):
+
+                            distance = self.calculate_distance(lat, lon, existing_cell['lat'], existing_cell['lon'])
+                            if distance < 0.01:  # 同站判断距离阈值
+                                if pci % 3 == existing_cell['pci'] % 3:
+                                    print(f"    [验证失败] LTE同站模3冲突: PCI={pci} (mod3={pci%3}) vs 现有PCI={existing_cell['pci']} (mod3={existing_cell['pci']%3})")
+                                    return False
+
+                    print(f"    [检查通过] LTE模3约束")
+
+                finally:
+                    # 恢复原始PCI值
+                    self.all_cells_combined.loc[temp_cell_mask, 'pci'] = original_pci
+
+            # 如果所有检查都通过，则满足约束
+            print(f"    [验证成功] PCI={pci} 满足所有原始约束条件")
+            return True
+
+        except Exception as e:
+            print(f"    [验证警告] 保底PCI验证时发生异常: {e}")
+            import traceback
+            traceback.print_exc()
+            # 验证失败时保守处理，认为不满足约束
+            return False
+
+    def get_temp_assignment_for_validation(self, enodeb_id: int, cell_id: int, pci: int) -> bool:
+        """获取临时分配信息（保留接口，可能后续扩展使用）"""
+        return True
 
     def assign_pci_with_reuse_priority(self, enodeb_id: int, cell_id: int) -> Tuple[Optional[int], str, float, float]:
         """
@@ -2148,16 +2391,32 @@ class LTENRPCIPlanner:
                 best_pci_info = compliant_pcis[0]
                 best_pci = best_pci_info[0]
                 min_distance = best_pci_info[1]
-                
-                # 确定分配原因
-                reason = f'no_compliant_pci_fallback_downgrade_{self.reuse_distance_km}km_to_{min(3.0, 2.0)}km'
-                
+
+                # 验证智能降级找到的PCI是否满足原始约束条件
+                if self.validate_fallback_pci_meets_constraints(best_pci, target_lat, target_lon, earfcn_dl, enodeb_id, cell_id):
+                    print(f"    [验证通过] 智能降级PCI {best_pci} 实际满足原始约束条件")
+                    reason = 'fallback_validated_meets_constraints'
+                else:
+                    print(f"    [验证失败] 智能降级PCI {best_pci} 不满足原始约束条件")
+                    reason = f'no_compliant_pci_fallback_downgrade_{self.reuse_distance_km}km_to_{min(3.0, 2.0)}km'
+
                 return best_pci, reason, earfcn_dl, min_distance
             else:
-                # 如果降级后仍然找不到，使用保底方案
+                # 如果降级后仍然找不到，使用改进的保底方案
                 self.failure_reasons['no_compliant_pci'].append(f"{enodeb_id}-{cell_id}")
-                fallback_pci = enodeb_id % len(self.pci_range)
-                return fallback_pci, 'no_compliant_pci_fallback', earfcn_dl, 0.0
+
+                # 关键修复：改进保底方案，避免同站同PCI冲突
+                fallback_pci = self.calculate_fallback_pci(enodeb_id, cell_id, target_lat, target_lon)
+
+                # 验证保底PCI是否满足原始约束条件
+                if self.validate_fallback_pci_meets_constraints(fallback_pci, target_lat, target_lon, earfcn_dl, enodeb_id, cell_id):
+                    print(f"    [验证通过] 保底PCI {fallback_pci} 实际满足原始约束条件")
+                    fallback_reason = 'fallback_validated_meets_constraints'
+                else:
+                    print(f"    [验证失败] 保底PCI {fallback_pci} 不满足原始约束条件")
+                    fallback_reason = 'no_compliant_pci_fallback'
+
+                return fallback_pci, fallback_reason, earfcn_dl, 0.0
         
         # 选择最优的PCI（经过多重优先级排序后的第一个）
         best_pci_info = compliant_pcis[0]
@@ -3189,6 +3448,8 @@ def main():
         import traceback
         traceback.print_exc()
 
+
+  
 
 if __name__ == "__main__":
     main()
