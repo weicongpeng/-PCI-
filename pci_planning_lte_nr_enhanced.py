@@ -466,6 +466,15 @@ class NetworkParameterUpdater:
         print(f"LTE全量工参列名: {list(lte_full_df.columns)}")
         print(f"LTE现网工参列名: {list(lte_online_df.columns)}")
         print(f"模糊匹配结果 - eNodeB标识: {enodeb_id_col}, 小区标识: {cell_id_col}")
+        
+        # 确保列名有效再进行下一步操作
+        if enodeb_id_col is None:
+            print("错误: 无法在LTE全量工参中找到eNodeB标识列")
+            return lte_full_df  # 返回原数据框，不进行更新
+        if cell_id_col is None:
+            print("错误: 无法在LTE全量工参中找到小区标识列")
+            return lte_full_df  # 返回原数据框，不进行更新
+            
         lte_full_df['merge_key'] = lte_full_df[enodeb_id_col].astype(str) + "_" + lte_full_df[cell_id_col].astype(str)
         lte_online_df['merge_key'] = lte_online_df['eNBId'].astype(str) + "_" + lte_online_df['cellLocalId'].astype(str)
         
@@ -565,16 +574,20 @@ class NetworkParameterUpdater:
             # 第一分组 - 只对新增小区强制填入"电信中兴"，其他情况不操作
             if '第一分组' in col:
                 # 只对值为空的单元格填入默认值，跳过表头行
-                df.loc[2:, col] = df.loc[2:, col].fillna('电信中兴')
+                if len(df) > 2:  # 确保有足够的数据行
+                    df.iloc[2:, df.columns.get_loc(col)] = df.iloc[2:, df.columns.get_loc(col)].fillna('电信中兴')
             # 系统制式 - 强制填入"1"，跳过表头行
             elif '系统制式' in col:
-                df.loc[2:, col] = '1'
+                if len(df) > 2:  # 确保有足够的数据行
+                    df.iloc[2:, df.columns.get_loc(col)] = '1'
             # 移动国家码 - 强制填入"460"，跳过表头行
             elif '移动国家码' in col:
-                df.loc[2:, col] = '460'
+                if len(df) > 2:  # 确保有足够的数据行
+                    df.iloc[2:, df.columns.get_loc(col)] = '460'
             # 移动网络码 - 默认填入"11"，跳过表头行
             elif '移动网络码' in col:
-                df.loc[2:, col] = df.loc[2:, col].fillna('11')
+                if len(df) > 2:  # 确保有足够的数据行
+                    df.iloc[2:, df.columns.get_loc(col)] = df.iloc[2:, df.columns.get_loc(col)].fillna('11')
             # 基站名称 - 保持为空时不处理
             elif '基站名称' in col:
                 df[col] = df[col]  # 保持原值
@@ -596,10 +609,12 @@ class NetworkParameterUpdater:
             # 第一分组 - 只对新增小区强制填入"河源电信"，其他情况不操作
             if '第一分组' in col:
                 # 只对值为空的单元格填入默认值，跳过表头行
-                df.loc[2:, col] = df.loc[2:, col].fillna('河源电信')
+                if len(df) > 2:  # 确保有足够的数据行
+                    df.iloc[2:, df.columns.get_loc(col)] = df.iloc[2:, df.columns.get_loc(col)].fillna('河源电信')
             # 移动国家码 - 强制填入"460"，跳过表头行
             elif '移动国家码' in col:
-                df.loc[2:, col] = '460'
+                if len(df) > 2:  # 确保有足够的数据行
+                    df.iloc[2:, df.columns.get_loc(col)] = '460'
             # gNodeBLength - 根据SSB频点判断
             elif 'gNodeBLength' in col:
                 df = self._fill_gnodeb_length(df, col)
@@ -626,7 +641,8 @@ class NetworkParameterUpdater:
         if ssb_col is None:
             print("警告: 未找到SSB频点列，无法判断gNodeBLength")
             # 只对数据行（从第3行开始，索引2）填充默认值
-            df.loc[2:, length_col] = df.loc[2:, length_col].fillna(5)
+            if len(df) > 2:  # 确保有足够的数据行
+                df.iloc[2:, df.columns.get_loc(length_col)] = df.iloc[2:, df.columns.get_loc(length_col)].fillna(5)
             return df
         
         # 根据SSB频点范围判断gNodeBLength
@@ -648,7 +664,8 @@ class NetworkParameterUpdater:
                 return "未找到"  # 当SSB频点无法转换为数值时填充"未找到"
         
         # 只对数据行（从第3行开始，索引2）应用判断逻辑
-        df.loc[2:, length_col] = df.loc[2:, ssb_col].apply(determine_gnodeb_length)
+        if len(df) > 2:  # 确保有足够的数据行
+            df.iloc[2:, df.columns.get_loc(length_col)] = df.iloc[2:, df.columns.get_loc(ssb_col)].apply(determine_gnodeb_length)
         return df
 
     def _fill_mnc_from_plmn(self, df: pd.DataFrame, mnc_col: str) -> pd.DataFrame:
@@ -718,6 +735,15 @@ class NetworkParameterUpdater:
         # 使用模糊匹配查找列名
         enodeb_id_col = self._find_column_by_fuzzy_match(lte_full_df, 'eNodeB标识')
         cell_id_col = self._find_column_by_fuzzy_match(lte_full_df, '小区标识')
+        
+        # 确保列名有效再进行下一步操作
+        if enodeb_id_col is None:
+            print("错误: 无法在LTE全量工参中找到eNodeB标识列")
+            return lte_full_df  # 返回原数据框，不进行更新
+        if cell_id_col is None:
+            print("错误: 无法在LTE全量工参中找到小区标识列")
+            return lte_full_df  # 返回原数据框，不进行更新
+            
         lte_full_df['merge_key'] = lte_full_df[enodeb_id_col].astype(str) + "_" + lte_full_df[cell_id_col].astype(str)
         lte_online_df['merge_key'] = lte_online_df['eNBId'].astype(str) + "_" + lte_online_df['cellLocalId'].astype(str)
         
@@ -810,6 +836,20 @@ class NetworkParameterUpdater:
         mnc_col = self._find_column_by_fuzzy_match(nr_full_df, '移动网络码')
         gnodb_id_col = self._find_column_by_fuzzy_match(nr_full_df, 'gNodeB标识')
         cell_id_col = self._find_column_by_fuzzy_match(nr_full_df, '小区标识')
+        
+        # 确保列名有效再进行下一步操作
+        if mcc_col is None:
+            print("错误: 无法在NR全量工参中找到移动国家码列")
+            return nr_full_df  # 返回原数据框，不进行更新
+        if mnc_col is None:
+            print("错误: 无法在NR全量工参中找到移动网络码列")
+            return nr_full_df  # 返回原数据框，不进行更新
+        if gnodb_id_col is None:
+            print("错误: 无法在NR全量工参中找到gNodeB标识列")
+            return nr_full_df  # 返回原数据框，不进行更新
+        if cell_id_col is None:
+            print("错误: 无法在NR全量工参中找到小区标识列")
+            return nr_full_df  # 返回原数据框，不进行更新
         
         # 处理plmn字段：删除"-"，并将值为"1"的移动网络码改为"01"
         def format_plmn(plmn):
@@ -1312,6 +1352,25 @@ class LTENRPCIPlanner:
         
         result = c * 6371  # 地球半径（公里）
         self.distance_cache[cache_key] = result
+        return result
+    
+    def calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """
+        计算两点之间的距离（公里）
+        """
+        # 转换为弧度
+        lat1_rad = math.radians(lat1)
+        lon1_rad = math.radians(lon1)
+        lat2_rad = math.radians(lat2)
+        lon2_rad = math.radians(lon2)
+        
+        # Haversine公式
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+        a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        
+        result = c * 6371  # 地球半径（公里）
         return result
     
     def get_cell_info(self, enodeb_id: int, cell_id: int) -> Tuple[Optional[pd.Series], str]:
@@ -2518,9 +2577,22 @@ class LTENRPCIPlanner:
         
         # 彻底清除所有相关缓存（关键修复）
         # 1. 清除同站点缓存
-        same_site_keys = [key for key in self.same_site_cache.keys() if key[0] == enodeb_id]
-        for key in same_site_keys:
-            del self.same_site_cache[key]
+        # 获取当前小区的经纬度用于清除相关缓存
+        cell_info, _ = self.get_cell_info(enodeb_id, cell_id)
+        if cell_info is not None and not pd.isna(cell_info['lat']) and not pd.isna(cell_info['lon']):
+            # 清除基于经纬度的同站点缓存（与当前小区位置相关的缓存）
+            target_lat = cell_info['lat']
+            target_lon = cell_info['lon']
+            same_site_keys = [key for key in self.same_site_cache.keys() 
+                             if len(key) >= 2 and 
+                             abs(key[0] - target_lat) < 0.0001 and 
+                             abs(key[1] - target_lon) < 0.0001]
+            for key in same_site_keys:
+                if key in self.same_site_cache:  # 检查键是否仍然存在
+                    del self.same_site_cache[key]
+        else:
+            # 如果无法获取位置信息，清除所有缓存
+            self.same_site_cache.clear()
         
         # 2. 清除距离缓存（避免使用旧的干扰计算结果）
         cell_info, _ = self.get_cell_info(enodeb_id, cell_id)
