@@ -1126,7 +1126,8 @@ class NetworkParameterUpdater:
 
 class LTENRPCIPlanner:
     def __init__(self, reuse_distance_km: float = 3.0, lte_inherit_mod3: bool = False,
-                 nr_inherit_mod30: bool = False, network_type: str = "LTE", params_file: str = None):
+                 nr_inherit_mod30: bool = False, network_type: str = "LTE", params_file: str = None,
+                 pci_range: List[int] = None):
         """
         初始化LTE/NR分离式PCI规划工具
 
@@ -1136,6 +1137,7 @@ class LTENRPCIPlanner:
             nr_inherit_mod30: NR小区是否继承原PCI的模30值
             network_type: 当前处理的网络类型 ("LTE" 或 "NR")
             params_file: 使用的参数文件路径
+            pci_range: 用户指定的PCI范围列表，如果为None则使用默认范围
         """
         self.reuse_distance_km = reuse_distance_km
         self.lte_inherit_mod3 = lte_inherit_mod3
@@ -1143,14 +1145,37 @@ class LTENRPCIPlanner:
         self.network_type = network_type
         self.params_file = params_file  # 存储参数文件路径
         
-        # PCI范围根据网络类型设定
+        # PCI范围根据网络类型设定，或使用用户指定的范围
+        if pci_range is not None:
+            # 验证用户指定的PCI范围是否符合网络类型标准
+            if network_type == "LTE":
+                # 验证LTE范围：0-503
+                valid_range = list(range(0, 504))
+                invalid_pci = [pci for pci in pci_range if pci not in valid_range]
+                if invalid_pci:
+                    print(f"警告: 用户指定的LTE PCI范围包含无效值 {invalid_pci}，将被过滤")
+                    pci_range = [pci for pci in pci_range if pci in valid_range]
+                self.pci_range = sorted(list(set(pci_range)))  # 去重并排序
+            else:  # NR
+                # 验证NR范围：0-1007
+                valid_range = list(range(0, 1008))
+                invalid_pci = [pci for pci in pci_range if pci not in valid_range]
+                if invalid_pci:
+                    print(f"警告: 用户指定的NR PCI范围包含无效值 {invalid_pci}，将被过滤")
+                    pci_range = [pci for pci in pci_range if pci in valid_range]
+                self.pci_range = sorted(list(set(pci_range)))  # 去重并排序
+        else:
+            # 使用默认范围
+            if network_type == "LTE":
+                self.pci_range = list(range(0, 504))  # LTE PCI范围 0-503
+            else:  # NR
+                self.pci_range = list(range(0, 1008))  # NR PCI范围 0-1007
+        
         if network_type == "LTE":
-            self.pci_range = list(range(0, 504))  # LTE PCI范围 0-503
             self.inherit_mod = lte_inherit_mod3
             self.mod_value = 3  # LTE使用mod3
             self.dual_mod_requirement = False  # LTE只需要模3约束
         else:  # NR
-            self.pci_range = list(range(0, 1008))  # NR PCI范围 0-1007
             self.inherit_mod = nr_inherit_mod30
             self.mod_value = 30  # NR使用mod30
             self.dual_mod_requirement = True   # NR需要同时满足模3和模30约束
@@ -3318,7 +3343,7 @@ def main():
             
             # 为每种网络类型执行规划
             for network_type in networks_to_plan:
-                print(f"\\n{'='*50}")
+                print(f"\n{'='*50}")
                 print(f"开始规划 {network_type} 网络")
                 print(f"{'='*50}")
                 
@@ -3327,6 +3352,37 @@ def main():
                 lte_inherit_mod3 = inherit_choice in ['y', 'yes', '是']
                 nr_inherit_mod30 = False
                 
+                # 询问用户是否指定PCI范围
+                pci_range = None
+                range_choice = input(f"是否指定{network_type}网络的PCI范围？(y/n，默认n): ").strip().lower()
+                if range_choice in ['y', 'yes', '是']:
+                    while True:
+                        try:
+                            range_input = input(f"请输入{network_type}网络的PCI范围 (格式: 起始PCI-结束PCI，如 0-100): ").strip()
+                            if '-' in range_input:
+                                start_pci, end_pci = map(int, range_input.split('-'))
+                                if start_pci >= 0 and end_pci >= start_pci:
+                                    # 根据网络类型验证范围
+                                    if network_type == "LTE" and end_pci <= 503:
+                                        pci_range = list(range(start_pci, end_pci + 1))
+                                        print(f"已设置{network_type}网络PCI范围: {start_pci}-{end_pci}")
+                                        break
+                                    elif network_type == "NR" and end_pci <= 1007:
+                                        pci_range = list(range(start_pci, end_pci + 1))
+                                        print(f"已设置{network_type}网络PCI范围: {start_pci}-{end_pci}")
+                                        break
+                                    else:
+                                        if network_type == "LTE":
+                                            print("LTE网络PCI范围必须在0-503之间，请重新输入")
+                                        else:
+                                            print("NR网络PCI范围必须在0-1007之间，请重新输入")
+                                else:
+                                    print("起始PCI必须大于等于0且结束PCI必须大于等于起始PCI，请重新输入")
+                            else:
+                                print("格式错误，请使用 起始PCI-结束PCI 的格式，如 0-100")
+                        except ValueError:
+                            print("输入格式错误，请输入有效的数字")
+                
                 try:
                     # 创建规划器
                     planner = LTENRPCIPlanner(
@@ -3334,7 +3390,8 @@ def main():
                         lte_inherit_mod3=lte_inherit_mod3,
                         nr_inherit_mod30=nr_inherit_mod30,
                         network_type=network_type,
-                        params_file=params_file  # 传递参数文件路径
+                        params_file=params_file,  # 传递参数文件路径
+                        pci_range=pci_range  # 传递用户指定的PCI范围
                     )
                     
                     # 修改规划器以支持测试文件格式
@@ -3460,7 +3517,7 @@ def main():
             
             # 为每种网络类型执行规划
             for network_type in networks_to_plan:
-                print(f"\\n{'='*50}")
+                print(f"\n{'='*50}")
                 print(f"开始规划 {network_type} 网络")
                 print(f"{'='*50}")
                 
@@ -3474,6 +3531,37 @@ def main():
                     nr_inherit_mod30 = inherit_choice in ['y', 'yes', '是']
                     lte_inherit_mod3 = False
                 
+                # 询问用户是否指定PCI范围
+                pci_range = None
+                range_choice = input(f"是否指定{network_type}网络的PCI范围？(y/n，默认n): ").strip().lower()
+                if range_choice in ['y', 'yes', '是']:
+                    while True:
+                        try:
+                            range_input = input(f"请输入{network_type}网络的PCI范围 (格式: 起始PCI-结束PCI，如 0-100): ").strip()
+                            if '-' in range_input:
+                                start_pci, end_pci = map(int, range_input.split('-'))
+                                if start_pci >= 0 and end_pci >= start_pci:
+                                    # 根据网络类型验证范围
+                                    if network_type == "LTE" and end_pci <= 503:
+                                        pci_range = list(range(start_pci, end_pci + 1))
+                                        print(f"已设置{network_type}网络PCI范围: {start_pci}-{end_pci}")
+                                        break
+                                    elif network_type == "NR" and end_pci <= 1007:
+                                        pci_range = list(range(start_pci, end_pci + 1))
+                                        print(f"已设置{network_type}网络PCI范围: {start_pci}-{end_pci}")
+                                        break
+                                    else:
+                                        if network_type == "LTE":
+                                            print("LTE网络PCI范围必须在0-503之间，请重新输入")
+                                        else:
+                                            print("NR网络PCI范围必须在0-1007之间，请重新输入")
+                                else:
+                                    print("起始PCI必须大于等于0且结束PCI必须大于等于起始PCI，请重新输入")
+                            else:
+                                print("格式错误，请使用 起始PCI-结束PCI 的格式，如 0-100")
+                        except ValueError:
+                            print("输入格式错误，请输入有效的数字")
+                
                 try:
                     # 创建规划器
                     planner = LTENRPCIPlanner(
@@ -3481,7 +3569,8 @@ def main():
                         lte_inherit_mod3=lte_inherit_mod3,
                         nr_inherit_mod30=nr_inherit_mod30,
                         network_type=network_type,
-                        params_file=params_file  # 传递参数文件路径
+                        params_file=params_file,  # 传递参数文件路径
+                        pci_range=pci_range  # 传递用户指定的PCI范围
                     )
 
                     # 加载数据
