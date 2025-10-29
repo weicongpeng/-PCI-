@@ -1124,6 +1124,828 @@ class NetworkParameterUpdater:
                 print(f"创建新工参文件失败: {e2}")
 
 
+class NeighborPlanningTool:
+    """
+    邻区规划工具类
+    支持NR到NR、LTE到LTE、NR到LTE的邻区关系规划
+    """
+
+    def __init__(self, neighbor_distance_km: float = 2.0, max_neighbors: int = 16):
+        """
+        初始化邻区规划工具
+
+        Args:
+            neighbor_distance_km: 邻区关系规划距离（公里）
+            max_neighbors: 每个小区的最大邻区数量
+        """
+        self.neighbor_distance_km = neighbor_distance_km
+        self.max_neighbors = max_neighbors
+        self.lte_cells = None
+        self.nr_cells = None
+        self.distance_cache = {}
+        self.params_file = None  # 全量工参文件路径
+
+        print(f"初始化邻区规划工具")
+        print(f"邻区关系规划距离: {neighbor_distance_km}km")
+        print(f"最大邻区数量: {max_neighbors}")
+
+    def generate_timestamp_suffix(self) -> str:
+        """生成时间戳后缀"""
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """
+        计算两点间的球面距离（公里）
+        使用Haversine公式
+        """
+        # 检查缓存
+        cache_key = (lat1, lon1, lat2, lon2)
+        if cache_key in self.distance_cache:
+            return self.distance_cache[cache_key]
+
+        # 将角度转换为弧度
+        lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+
+        # Haversine公式
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+
+        # 地球半径（公里）
+        earth_radius_km = 6371.0
+        distance = earth_radius_km * c
+
+        # 缓存结果
+        self.distance_cache[cache_key] = distance
+        return distance
+
+    def preprocess_parameter_cells(self, raw_df: pd.DataFrame, network_type: str) -> pd.DataFrame:
+        """
+        预处理全量工参中的小区数据，标准化列名
+        """
+        if raw_df.empty:
+            return pd.DataFrame()
+
+        processed = pd.DataFrame()
+
+        if network_type == "LTE":
+            # LTE列映射
+            processed['enodeb_id'] = raw_df['eNodeB标识\neNodeB ID\nlong:[0..1048575]']
+            processed['cell_id'] = raw_df['小区标识\ncellLocalId\ninteger:[0~2147483647]']
+            processed['cell_name'] = raw_df['小区名称\nuserLabel\nstring[0..128]']
+            processed['pci'] = raw_df['物理小区识别码\nPCI\nlong:[0..503]']
+            processed['lat'] = raw_df['小区纬度\neNodeB Latitude\ndouble:[-90..90]']
+            processed['lon'] = raw_df['小区经度\neNodeB Longitude double:[-180..180]']
+            processed['earfcn_dl'] = raw_df['下行链路的中心载频\nearfcnDl\ndouble Step：0.1 \nUnite：MHz']
+        else:  # NR
+            processed['enodeb_id'] = raw_df['gNodeB标识\ngNodeB ID\nLong:[0..1048575]']
+            processed['cell_id'] = raw_df['小区标识\ncellLocalId\nInteger:[0~2147483647]']
+            processed['cell_name'] = raw_df['小区名称\nCELL NAME\nString[0..128]']
+            processed['pci'] = raw_df['物理小区识别码\nPCI\nLong:[0..1007]']
+            processed['lat'] = raw_df['小区纬度\nCell  Latitude\nDouble:[-90..90]']
+            processed['lon'] = raw_df['小区经度\nCell  Longitude Double:[-180..180]']
+            processed['earfcn_dl'] = raw_df['填写SSB频点\nSSB Frequency\nDouble Step：0.01 \nUnite：MHz']
+
+        processed['cell_type'] = network_type
+
+        # 转换所有数值列（cell_name保持字符串格式）
+        numeric_columns = ['enodeb_id', 'cell_id', 'pci', 'lat', 'lon', 'earfcn_dl']
+        for col in numeric_columns:
+            if col in processed.columns:
+                processed[col] = pd.to_numeric(processed[col], errors='coerce')
+
+        return processed
+
+    def load_full_parameter_data(self, params_file: str) -> bool:
+        """
+        从全量工参文件中加载小区数据
+
+        Args:
+            params_file: 全量工参文件路径
+
+        Returns:
+            bool: 加载成功返回True
+        """
+        try:
+            self.params_file = params_file
+            print(f"正在加载全量工参文件: {os.path.basename(params_file)}")
+
+            # 读取LTE数据
+            try:
+                lte_raw = pd.read_excel(params_file, sheet_name='LTE Project Parameters')
+                # 跳过前两行（可能是表头说明）
+                if len(lte_raw) > 2:
+                    lte_raw = lte_raw.iloc[2:].reset_index(drop=True)
+                self.lte_cells = self.preprocess_parameter_cells(lte_raw, 'LTE')
+                print(f"加载LTE小区数据: {len(self.lte_cells)} 个小区")
+            except Exception as e:
+                print(f"加载LTE数据失败: {e}")
+                self.lte_cells = None
+
+            # 读取NR数据
+            try:
+                nr_raw = pd.read_excel(params_file, sheet_name='NR Project Parameters')
+                # 跳过前两行（可能是表头说明）
+                if len(nr_raw) > 2:
+                    nr_raw = nr_raw.iloc[2:].reset_index(drop=True)
+                self.nr_cells = self.preprocess_parameter_cells(nr_raw, 'NR')
+                print(f"加载NR小区数据: {len(self.nr_cells)} 个小区")
+            except Exception as e:
+                print(f"加载NR数据失败: {e}")
+                self.nr_cells = None
+
+            return self.lte_cells is not None or self.nr_cells is not None
+
+        except Exception as e:
+            print(f"加载全量工参文件失败: {e}")
+            return False
+
+    def load_cell_data(self, cells_file: str) -> bool:
+        """
+        加载小区数据
+
+        Args:
+            cells_file: 小区数据文件路径
+
+        Returns:
+            bool: 加载成功返回True
+        """
+        try:
+            # 读取Excel文件
+            xl_file = pd.ExcelFile(cells_file)
+            sheet_names = xl_file.sheet_names
+
+            self.lte_cells = None
+            self.nr_cells = None
+
+            # 查找LTE工作表
+            lte_sheets = [name for name in sheet_names if 'LTE' in name.upper()]
+            if lte_sheets:
+                self.lte_cells = pd.read_excel(cells_file, sheet_name=lte_sheets[0])
+                print(f"加载LTE小区数据: {len(self.lte_cells)} 个小区")
+
+            # 查找NR工作表
+            nr_sheets = [name for name in sheet_names if 'NR' in name.upper()]
+            if nr_sheets:
+                self.nr_cells = pd.read_excel(cells_file, sheet_name=nr_sheets[0])
+                print(f"加载NR小区数据: {len(self.nr_cells)} 个小区")
+
+            return self.lte_cells is not None or self.nr_cells is not None
+
+        except Exception as e:
+            print(f"加载小区数据失败: {e}")
+            return False
+
+    def get_cell_key(self, row: pd.Series, network_type: str) -> str:
+        """
+        获取小区的唯一标识键
+
+        Args:
+            row: 小区数据行
+            network_type: 网络类型 ('LTE' 或 'NR')
+
+        Returns:
+            str: 小区唯一标识
+        """
+        if network_type == 'LTE':
+            # LTE使用eNodeB ID + Cell ID
+            enodeb_id = str(row.get('enodeb_id', '')).strip()
+            cell_id = str(row.get('cell_id', '')).strip()
+            return f"LTE_{enodeb_id}_{cell_id}"
+        else:  # NR
+            # NR使用MCC + MNC + gNodeB ID + Cell ID
+            mcc = str(row.get('mcc', '')).strip()
+            mnc = str(row.get('mnc', '')).strip()
+            gnodeb_id = str(row.get('enodeb_id', '')).strip()
+            cell_id = str(row.get('cell_id', '')).strip()
+            return f"NR_{mcc}_{mnc}_{gnodeb_id}_{cell_id}"
+
+    def get_cell_key_no_prefix(self, row: pd.Series, network_type: str) -> str:
+        """
+        获取小区的唯一标识键（无网络类型前缀）
+
+        Args:
+            row: 小区数据行
+            network_type: 网络类型 ('LTE' 或 'NR')
+
+        Returns:
+            str: 小区唯一标识（无LTE/NR前缀）
+        """
+        if network_type == 'LTE':
+            # LTE使用eNodeB ID + Cell ID
+            enodeb_id = str(row.get('enodeb_id', '')).strip()
+            cell_id = str(row.get('cell_id', '')).strip()
+            return f"{enodeb_id}_{cell_id}"
+        else:  # NR
+            # NR使用MCC + MNC + gNodeB ID + Cell ID
+            mcc = str(row.get('mcc', '')).strip()
+            mnc = str(row.get('mnc', '')).strip()
+            gnodeb_id = str(row.get('enodeb_id', '')).strip()
+            cell_id = str(row.get('cell_id', '')).strip()
+            return f"{mcc}_{mnc}_{gnodeb_id}_{cell_id}"
+
+    def get_cell_location(self, row: pd.Series, network_type: str) -> tuple:
+        """
+        获取小区的经纬度
+
+        Args:
+            row: 小区数据行
+            network_type: 网络类型 ('LTE' 或 'NR')
+
+        Returns:
+            tuple: (纬度, 经度)
+        """
+        lat = row.get('lat', None)
+        lon = row.get('lon', None)
+
+        if pd.isna(lat) or pd.isna(lon):
+            return None, None
+
+        try:
+            return float(lat), float(lon)
+        except (ValueError, TypeError):
+            return None, None
+
+    def estimate_distance_by_enodeb_id(self, enodeb1: int, enodeb2: int) -> float:
+        """
+        根据基站ID估算距离（当没有经纬度时）
+        基站ID相近的认为距离较近
+        """
+        if enodeb1 is None or enodeb2 is None:
+            return float('inf')
+
+        # 计算基站ID的差值，转换为估算距离
+        id_diff = abs(enodeb1 - enodeb2)
+
+        # 基站ID每相差1000，估算为1公里距离
+        estimated_distance = id_diff / 1000.0
+
+        # 设置最大估算距离为10公里
+        return min(estimated_distance, 10.0)
+
+    def get_cell_info(self, row: pd.Series, network_type: str) -> dict:
+        """
+        获取小区的基本信息
+
+        Args:
+            row: 小区数据行
+            network_type: 网络类型 ('LTE' 或 'NR')
+
+        Returns:
+            dict: 小区基本信息
+        """
+        cell_name = str(row.get('cell_name', '')).strip()
+        if not cell_name or cell_name == '':
+            enodeb_id = str(row.get('enodeb_id', 'unknown'))
+            cell_id = str(row.get('cell_id', 'unknown'))
+            cell_name = f"{network_type}_{enodeb_id}_{cell_id}"
+
+        earfcn = row.get('earfcn_dl', '')
+        pci = row.get('pci', '')
+
+        return {
+            'cell_name': cell_name,
+            'earfcn': earfcn,
+            'pci': pci
+        }
+
+    def get_enodeb_id(self, row: pd.Series, network_type: str):
+        """
+        获取基站ID - 使用标准化列名
+        """
+        try:
+            # 使用预处理后的标准化列名
+            enodeb_id = row.get('enodeb_id', None)
+            return int(enodeb_id) if enodeb_id is not None and not pd.isna(enodeb_id) else None
+        except (ValueError, TypeError):
+            return None
+
+    def plan_neighbors_for_network(self, source_network: str, target_network: str) -> pd.DataFrame:
+        """
+        为指定网络类型规划邻区关系
+
+        Args:
+            source_network: 源网络类型 ('LTE' 或 'NR')
+            target_network: 目标网络类型 ('LTE' 或 'NR')
+
+        Returns:
+            pd.DataFrame: 邻区关系数据
+        """
+        source_cells = self.lte_cells if source_network == 'LTE' else self.nr_cells
+        target_cells = self.lte_cells if target_network == 'LTE' else self.nr_cells
+
+        if source_cells is None or target_cells is None:
+            print(f"缺少{source_network}或{target_network}小区数据")
+            return pd.DataFrame()
+
+        print(f"\n开始规划 {source_network} 到 {target_network} 的邻区关系...")
+
+        neighbor_relations = []
+
+        # 遍历源小区
+        for idx1, source_row in source_cells.iterrows():
+            source_key = self.get_cell_key(source_row, source_network)
+            source_lat, source_lon = self.get_cell_location(source_row, source_network)
+            source_info = self.get_cell_info(source_row, source_network)
+
+            # 获取源小区基站ID
+            source_enodeb_id = self.get_enodeb_id(source_row, source_network)
+
+            # 存储候选邻区
+            candidate_neighbors = []
+
+            # 遍历目标小区
+            for idx2, target_row in target_cells.iterrows():
+                target_key = self.get_cell_key(target_row, target_network)
+                target_lat, target_lon = self.get_cell_location(target_row, target_network)
+                target_info = self.get_cell_info(target_row, target_network)
+
+                # 获取目标小区基站ID
+                target_enodeb_id = self.get_enodeb_id(target_row, target_network)
+
+                # 跳过相同小区
+                if source_key == target_key:
+                    continue
+
+                # 计算距离 - 优先使用经纬度，如果没有则使用基站ID相近性
+                if source_lat is not None and source_lon is not None and target_lat is not None and target_lon is not None:
+                    # 使用实际经纬度计算距离
+                    distance = self.calculate_distance(source_lat, source_lon, target_lat, target_lon)
+                elif source_enodeb_id is not None and target_enodeb_id is not None:
+                    # 使用基站ID估算距离
+                    distance = self.estimate_distance_by_enodeb_id(source_enodeb_id, target_enodeb_id)
+                else:
+                    # 无法计算距离，跳过
+                    continue
+
+                # 检查是否在规划距离内
+                if distance <= self.neighbor_distance_km:
+                    candidate_neighbors.append({
+                        'source_key': source_key,
+                        'target_key': target_key,
+                        'distance': distance,
+                        'source_cell_name': source_info['cell_name'],
+                        'target_cell_name': target_info['cell_name'],
+                        'source_earfcn': source_info['earfcn'],
+                        'target_earfcn': target_info['earfcn'],
+                        'source_pci': source_info['pci'],
+                        'target_pci': target_info['pci'],
+                        'source_lat': source_lat if source_lat is not None else 0,
+                        'source_lon': source_lon if source_lon is not None else 0,
+                        'target_lat': target_lat if target_lat is not None else 0,
+                        'target_lon': target_lon if target_lon is not None else 0,
+                        'source_enodeb_id': source_enodeb_id,
+                        'target_enodeb_id': target_enodeb_id
+                    })
+
+            # 按距离排序，选择最近的max_neighbors个小区
+            candidate_neighbors.sort(key=lambda x: x['distance'])
+            selected_neighbors = candidate_neighbors[:self.max_neighbors]
+
+            # 添加到结果中
+            neighbor_relations.extend(selected_neighbors)
+
+            if len(selected_neighbors) > 0:
+                print(f"  {source_info['cell_name']}: 规划 {len(selected_neighbors)} 个邻区")
+
+        # 转换为DataFrame
+        if neighbor_relations:
+            result_df = pd.DataFrame(neighbor_relations)
+            print(f"\n{source_network} 到 {target_network} 邻区关系规划完成，共 {len(result_df)} 条关系")
+            return result_df
+        else:
+            print(f"\n{source_network} 到 {target_network} 没有找到符合条件的邻区关系")
+            return pd.DataFrame()
+
+    def save_neighbor_results(self, nr_to_nr_df: pd.DataFrame, lte_to_lte_df: pd.DataFrame,
+                            nr_to_lte_df: pd.DataFrame) -> bool:
+        """
+        保存邻区规划结果到文件
+
+        Args:
+            nr_to_nr_df: NR到NR邻区关系
+            lte_to_lte_df: LTE到LTE邻区关系
+            nr_to_lte_df: NR到LTE邻区关系
+
+        Returns:
+            bool: 保存成功返回True
+        """
+        try:
+            timestamp = self.generate_timestamp_suffix()
+            output_dir = "输出文件"
+            os.makedirs(output_dir, exist_ok=True)
+
+            saved_files = []
+
+            # 保存NR到NR邻区关系
+            if not nr_to_nr_df.empty:
+                filename = f"{output_dir}/邻区关系_NR到NR_{timestamp}.xlsx"
+                nr_to_nr_df.to_excel(filename, index=False, sheet_name='NR到NR邻区关系')
+                saved_files.append(filename)
+                print(f"✅ NR到NR邻区关系已保存: {filename}")
+
+            # 保存LTE到LTE邻区关系
+            if not lte_to_lte_df.empty:
+                filename = f"{output_dir}/邻区关系_LTE到LTE_{timestamp}.xlsx"
+                lte_to_lte_df.to_excel(filename, index=False, sheet_name='LTE到LTE邻区关系')
+                saved_files.append(filename)
+                print(f"✅ LTE到LTE邻区关系已保存: {filename}")
+
+            # 保存NR到LTE邻区关系
+            if not nr_to_lte_df.empty:
+                filename = f"{output_dir}/邻区关系_NR到LTE_{timestamp}.xlsx"
+                nr_to_lte_df.to_excel(filename, index=False, sheet_name='NR到LTE邻区关系')
+                saved_files.append(filename)
+                print(f"✅ NR到LTE邻区关系已保存: {filename}")
+
+            if saved_files:
+                print(f"\n邻区规划结果保存完成，共生成 {len(saved_files)} 个文件")
+                return True
+            else:
+                print("没有生成任何邻区关系文件")
+                return False
+
+        except Exception as e:
+            print(f"保存邻区规划结果失败: {e}")
+            return False
+
+    def load_cells_to_plan(self, cells_file: str) -> tuple:
+        """
+        加载待规划小区清单
+
+        Args:
+            cells_file: 待规划小区文件路径
+
+        Returns:
+            tuple: (lte_cells_df, nr_cells_df)
+        """
+        try:
+            xl_file = pd.ExcelFile(cells_file)
+            sheet_names = xl_file.sheet_names
+
+            lte_cells = None
+            nr_cells = None
+
+            # 查找LTE工作表
+            lte_sheets = [name for name in sheet_names if 'LTE' in name.upper()]
+            if lte_sheets:
+                lte_cells = pd.read_excel(cells_file, sheet_name=lte_sheets[0])
+                print(f"待规划LTE小区: {len(lte_cells)} 个")
+
+            # 查找NR工作表
+            nr_sheets = [name for name in sheet_names if 'NR' in name.upper()]
+            if nr_sheets:
+                nr_cells = pd.read_excel(cells_file, sheet_name=nr_sheets[0])
+                print(f"待规划NR小区: {len(nr_cells)} 个")
+
+            return lte_cells, nr_cells
+
+        except Exception as e:
+            print(f"加载待规划小区文件失败: {e}")
+            return None, None
+
+    def get_cell_details_from_params(self, cells_to_plan: pd.DataFrame, network_type: str) -> pd.DataFrame:
+        """
+        从全量工参文件中获取待规划小区的详细信息
+
+        Args:
+            cells_to_plan: 待规划小区清单
+            network_type: 网络类型 ('LTE' 或 'NR')
+
+        Returns:
+            pd.DataFrame: 包含详细信息的待规划小区数据
+        """
+        if cells_to_plan is None or len(cells_to_plan) == 0:
+            return pd.DataFrame()
+
+        source_cells = self.lte_cells if network_type == 'LTE' else self.nr_cells
+        if source_cells is None or len(source_cells) == 0:
+            return pd.DataFrame()
+
+        print(f"正在从全量工参中获取{network_type}待规划小区的详细信息...")
+
+        detailed_cells = []
+
+        for _, plan_row in cells_to_plan.iterrows():
+            if network_type == 'LTE':
+                # 从待规划清单中获取关键信息
+                plan_enodeb_id = str(plan_row.get('eNodeBID', '')).strip()
+                plan_cell_id = str(plan_row.get('CellID', '')).strip()
+
+                # 在全量工参中查找匹配的小区 - 使用标准化列名
+                for _, param_row in source_cells.iterrows():
+                    param_enodeb_id = str(param_row.get('enodeb_id', '')).strip()
+                    param_cell_id = str(param_row.get('cell_id', '')).strip()
+
+                    if plan_enodeb_id == param_enodeb_id and plan_cell_id == param_cell_id:
+                        detailed_cells.append(param_row)
+                        break
+            else:  # NR
+                # 从待规划清单中获取关键信息
+                plan_gnodeb_id = str(plan_row.get('gNodeBID', '')).strip()
+                plan_cell_id = str(plan_row.get('CellID', '')).strip()
+
+                # 在全量工参中查找匹配的小区 - 使用标准化列名
+                for _, param_row in source_cells.iterrows():
+                    param_gnodeb_id = str(param_row.get('enodeb_id', '')).strip()
+                    param_cell_id = str(param_row.get('cell_id', '')).strip()
+
+                    if plan_gnodeb_id == param_gnodeb_id and plan_cell_id == param_cell_id:
+                        detailed_cells.append(param_row)
+                        break
+
+        if detailed_cells:
+            result_df = pd.DataFrame(detailed_cells)
+            print(f"成功匹配 {len(result_df)} 个{network_type}待规划小区")
+            return result_df
+        else:
+            print(f"未找到匹配的{network_type}待规划小区")
+            return pd.DataFrame()
+
+    def plan_neighbors_for_target_cells(self, target_cells: pd.DataFrame, target_network: str,
+                                      source_network: str, all_param_cells: pd.DataFrame) -> pd.DataFrame:
+        """
+        为指定的待规划小区寻找邻区关系（优化版本）
+
+        Args:
+            target_cells: 待规划小区（从待规划清单中读取的）
+            target_network: 待规划小区的网络类型
+            source_network: 寻找邻区的源网络类型
+            all_param_cells: 全量工参中的所有小区
+
+        Returns:
+            pd.DataFrame: 邻区关系数据
+        """
+        if target_cells is None or len(target_cells) == 0:
+            return pd.DataFrame()
+
+        if all_param_cells is None or len(all_param_cells) == 0:
+            return pd.DataFrame()
+
+        relation_name = f"{target_network}到{source_network}"
+        print(f"\n开始规划 {relation_name} 的邻区关系...")
+
+        neighbor_relations = []
+
+        # 预计算所有源小区的位置信息，避免重复计算
+        print("正在预处理源小区位置信息...")
+        source_cell_info = []
+        for idx, source_row in all_param_cells.iterrows():
+            source_key = self.get_cell_key(source_row, source_network)
+            source_lat, source_lon = self.get_cell_location(source_row, source_network)
+            source_info = self.get_cell_info(source_row, source_network)
+            source_enodeb_id = self.get_enodeb_id(source_row, source_network)
+
+            source_cell_info.append({
+                'key': source_key,
+                'lat': source_lat,
+                'lon': source_lon,
+                'info': source_info,
+                'enodeb_id': source_enodeb_id
+            })
+
+        print(f"预处理完成，共 {len(source_cell_info)} 个源小区")
+
+        # 遍历待规划小区
+        for idx1, target_row in target_cells.iterrows():
+            target_key = self.get_cell_key(target_row, target_network)
+            target_lat, target_lon = self.get_cell_location(target_row, target_network)
+            target_info = self.get_cell_info(target_row, target_network)
+
+            if target_lat is None or target_lon is None:
+                continue
+
+            # 获取目标小区基站ID
+            target_enodeb_id = self.get_enodeb_id(target_row, target_network)
+
+            # 存储候选邻区
+            candidate_neighbors = []
+
+            # 遍历预处理的源小区信息
+            for source_data in source_cell_info:
+                source_key = source_data['key']
+                source_lat = source_data['lat']
+                source_lon = source_data['lon']
+                source_info = source_data['info']
+                source_enodeb_id = source_data['enodeb_id']
+
+                # 跳过相同小区
+                if target_key == source_key:
+                    continue
+
+                # 跳过无效位置
+                if source_lat is None or source_lon is None:
+                    continue
+
+                # 计算距离
+                distance = self.calculate_distance(target_lat, target_lon, source_lat, source_lon)
+
+                # 检查是否在规划距离内
+                if distance <= self.neighbor_distance_km:
+                    candidate_neighbors.append({
+                        'source_key': target_key,  # 待规划小区作为源
+                        'target_key': source_key,   # 全量工参中的小区作为目标
+                        'distance': distance,
+                        'source_cell_name': target_info['cell_name'],
+                        'target_cell_name': source_info['cell_name'],
+                        'source_earfcn': target_info['earfcn'],
+                        'target_earfcn': source_info['earfcn'],
+                        'source_pci': target_info['pci'],
+                        'target_pci': source_info['pci'],
+                        'source_lat': target_lat,
+                        'source_lon': target_lon,
+                        'target_lat': source_lat,
+                        'target_lon': source_lon,
+                        'source_enodeb_id': target_enodeb_id,
+                        'target_enodeb_id': source_enodeb_id
+                    })
+
+            # 按距离排序，选择最近的max_neighbors个小区
+            candidate_neighbors.sort(key=lambda x: x['distance'])
+            selected_neighbors = candidate_neighbors[:self.max_neighbors]
+
+            # 添加到结果中
+            neighbor_relations.extend(selected_neighbors)
+
+            if len(selected_neighbors) > 0:
+                print(f"  {target_info['cell_name']}: 规划 {len(selected_neighbors)} 个邻区")
+
+        # 转换为DataFrame
+        if neighbor_relations:
+            result_df = pd.DataFrame(neighbor_relations)
+            print(f"\n{relation_name} 邻区关系规划完成，共 {len(result_df)} 条关系")
+            return result_df
+        else:
+            print(f"\n{relation_name} 没有找到符合条件的邻区关系")
+            return pd.DataFrame()
+        """
+        为指定的待规划小区寻找邻区关系
+
+        Args:
+            target_cells: 待规划小区（从待规划清单中读取的）
+            target_network: 待规划小区的网络类型
+            source_network: 寻找邻区的源网络类型
+            all_param_cells: 全量工参中的所有小区
+
+        Returns:
+            pd.DataFrame: 邻区关系数据
+        """
+        if target_cells is None or len(target_cells) == 0:
+            return pd.DataFrame()
+
+        if all_param_cells is None or len(all_param_cells) == 0:
+            return pd.DataFrame()
+
+        relation_name = f"{target_network}到{source_network}"
+        print(f"\n开始规划 {relation_name} 的邻区关系...")
+
+        neighbor_relations = []
+
+        # 遍历待规划小区
+        for idx1, target_row in target_cells.iterrows():
+            target_key = self.get_cell_key(target_row, target_network)
+            target_lat, target_lon = self.get_cell_location(target_row, target_network)
+            target_info = self.get_cell_info(target_row, target_network)
+
+            if target_lat is None or target_lon is None:
+                continue
+
+            # 获取目标小区基站ID
+            target_enodeb_id = self.get_enodeb_id(target_row, target_network)
+
+            # 存储候选邻区
+            candidate_neighbors = []
+
+            # 遍历全量工参中的所有源网络小区
+            for idx2, source_row in all_param_cells.iterrows():
+                source_key = self.get_cell_key(source_row, source_network)
+                source_lat, source_lon = self.get_cell_location(source_row, source_network)
+                source_info = self.get_cell_info(source_row, source_network)
+
+                # 获取源小区基站ID
+                source_enodeb_id = self.get_enodeb_id(source_row, source_network)
+
+                # 跳过相同小区
+                if target_key == source_key:
+                    continue
+
+                # 计算距离
+                if target_lat is not None and target_lon is not None and source_lat is not None and source_lon is not None:
+                    distance = self.calculate_distance(target_lat, target_lon, source_lat, source_lon)
+                elif target_enodeb_id is not None and source_enodeb_id is not None:
+                    distance = self.estimate_distance_by_enodeb_id(target_enodeb_id, source_enodeb_id)
+                else:
+                    continue
+
+                # 检查是否在规划距离内
+                if distance <= self.neighbor_distance_km:
+                    candidate_neighbors.append({
+                        'source_key': target_key,  # 待规划小区作为源
+                        'target_key': source_key,   # 全量工参中的小区作为目标
+                        'distance': distance,
+                        'source_cell_name': target_info['cell_name'],
+                        'target_cell_name': source_info['cell_name'],
+                        'source_earfcn': target_info['earfcn'],
+                        'target_earfcn': source_info['earfcn'],
+                        'source_pci': target_info['pci'],
+                        'target_pci': source_info['pci'],
+                        'source_lat': target_lat,
+                        'source_lon': target_lon,
+                        'target_lat': source_lat,
+                        'target_lon': source_lon,
+                        'source_enodeb_id': target_enodeb_id,
+                        'target_enodeb_id': source_enodeb_id
+                    })
+
+            # 按距离排序，选择最近的max_neighbors个小区
+            candidate_neighbors.sort(key=lambda x: x['distance'])
+            selected_neighbors = candidate_neighbors[:self.max_neighbors]
+
+            # 添加到结果中
+            neighbor_relations.extend(selected_neighbors)
+
+            if len(selected_neighbors) > 0:
+                print(f"  {target_info['cell_name']}: 规划 {len(selected_neighbors)} 个邻区")
+
+        # 转换为DataFrame
+        if neighbor_relations:
+            result_df = pd.DataFrame(neighbor_relations)
+            print(f"\n{relation_name} 邻区关系规划完成，共 {len(result_df)} 条关系")
+            return result_df
+        else:
+            print(f"\n{relation_name} 没有找到符合条件的邻区关系")
+            return pd.DataFrame()
+
+    def run_neighbor_planning(self, cells_file: str, params_file: str, planning_type: str) -> bool:
+        """
+        运行指定类型的邻区规划流程
+
+        Args:
+            cells_file: 待规划小区文件路径
+            params_file: 全量工参文件路径
+            planning_type: 规划类型 ('NR到NR', 'LTE到LTE', 'NR到LTE')
+
+        Returns:
+            bool: 规划成功返回True
+        """
+        print("\n" + "="*60)
+        print(f"开始{planning_type}邻区关系规划")
+        print("="*60)
+
+        # 加载待规划小区清单
+        cells_to_plan_lte, cells_to_plan_nr = self.load_cells_to_plan(cells_file)
+
+        # 加载全量工参数据
+        if not self.load_full_parameter_data(params_file):
+            return False
+
+        result_df = pd.DataFrame()
+
+        if planning_type == 'NR到NR':
+            if cells_to_plan_nr is not None and len(cells_to_plan_nr) > 0:
+                # 获取待规划NR小区的详细信息
+                detailed_nr_cells = self.get_cell_details_from_params(cells_to_plan_nr, 'NR')
+                if len(detailed_nr_cells) > 0:
+                    result_df = self.plan_neighbors_for_target_cells(detailed_nr_cells, 'NR', 'NR', self.nr_cells)
+                else:
+                    print("未能获取待规划NR小区的详细信息")
+            else:
+                print("没有找到待规划的NR小区")
+
+        elif planning_type == 'LTE到LTE':
+            if cells_to_plan_lte is not None and len(cells_to_plan_lte) > 0:
+                # 获取待规划LTE小区的详细信息
+                detailed_lte_cells = self.get_cell_details_from_params(cells_to_plan_lte, 'LTE')
+                if len(detailed_lte_cells) > 0:
+                    result_df = self.plan_neighbors_for_target_cells(detailed_lte_cells, 'LTE', 'LTE', self.lte_cells)
+                else:
+                    print("未能获取待规划LTE小区的详细信息")
+            else:
+                print("没有找到待规划的LTE小区")
+
+        elif planning_type == 'NR到LTE':
+            if cells_to_plan_nr is not None and len(cells_to_plan_nr) > 0:
+                # 获取待规划NR小区的详细信息
+                detailed_nr_cells = self.get_cell_details_from_params(cells_to_plan_nr, 'NR')
+                if len(detailed_nr_cells) > 0:
+                    result_df = self.plan_neighbors_for_target_cells(detailed_nr_cells, 'NR', 'LTE', self.lte_cells)
+                else:
+                    print("未能获取待规划NR小区的详细信息")
+            else:
+                print("没有找到待规划的NR小区")
+
+        # 保存结果
+        if planning_type == 'NR到NR':
+            return self.save_neighbor_results(result_df, pd.DataFrame(), pd.DataFrame())
+        elif planning_type == 'LTE到LTE':
+            return self.save_neighbor_results(pd.DataFrame(), result_df, pd.DataFrame())
+        elif planning_type == 'NR到LTE':
+            return self.save_neighbor_results(pd.DataFrame(), pd.DataFrame(), result_df)
+
+        return False
+
+
 class LTENRPCIPlanner:
     def __init__(self, reuse_distance_km: float = 3.0, lte_inherit_mod3: bool = False,
                  nr_inherit_mod30: bool = False, network_type: str = "LTE", params_file: str = None,
@@ -3254,43 +4076,45 @@ def main():
     print("请选择要执行的操作:")
     print("1. PCI规划")
     print("2. 现网工参更新")
-    print("3. 退出")
-    
-    main_choice = input("请输入选择 (1/2/3): ").strip()
-    
-    if main_choice == "3":
+    print("3. 邻区规划")
+    print("4. 退出")
+
+    main_choice = input("请输入选择 (1/2/3/4): ").strip()
+
+    if main_choice == "4":
         print("程序退出")
         return
     
     if main_choice == "2":
         # 现网工参更新功能
         print("\\n=== 现网工参更新功能 ===")
-        
+
         # 检查压缩包是否存在
         if not os.path.exists(online_params_zip):
             print(f"错误: 找不到现网工参压缩包: {online_params_zip}")
             return
-        
+
         # 检查全量工参文件是否存在
         if not os.path.exists(params_file):
             print(f"错误: 找不到全量工参文件: {params_file}")
             return
-        
+
         # 执行工参更新
         updater = NetworkParameterUpdater()
         if updater.update_network_parameters():
             print("现网工参更新完成！")
         else:
             print("❌ 现网工参更新失败")
-        
+
         # 返回到主菜单
         print("\n请选择要执行的操作:")
         print("1. PCI规划")
         print("2. 现网工参更新")
-        print("3. 退出")
-        
-        main_choice = input("请输入选择 (1/2/3): ").strip()
-        
+        print("3. 邻区规划")
+        print("4. 退出")
+
+        main_choice = input("请输入选择 (1/2/3/4): ").strip()
+
         if main_choice == "1":
             # 继续执行PCI规划
             pass
@@ -3298,11 +4122,162 @@ def main():
             # 再次执行工参更新
             return main()
         elif main_choice == "3":
+            # 执行邻区规划
+            print("\\n=== 邻区规划功能 ===")
+
+            # 检查待规划小区文件是否存在
+            if not os.path.exists(cells_file):
+                print(f"错误: 找不到待规划小区文件: {cells_file}")
+                return
+
+            # 获取用户输入的邻区规划参数
+            print("请输入邻区规划参数:")
+
+            # 邻区关系规划距离
+            while True:
+                try:
+                    neighbor_distance = float(input(f"邻区关系规划距离 (km，默认2.0): ").strip() or "2.0")
+                    if neighbor_distance > 0:
+                        break
+                    else:
+                        print("邻区距离必须大于0，请重新输入")
+                except ValueError:
+                    print("请输入有效的数字")
+
+            # 最大邻区数量
+            while True:
+                try:
+                    max_neighbors = int(input(f"每个小区的最大邻区数量 (默认16): ").strip() or "16")
+                    if max_neighbors > 0:
+                        break
+                    else:
+                        print("最大邻区数量必须大于0，请重新输入")
+                except ValueError:
+                    print("请输入有效的整数")
+
+            # 选择邻区规划类型
+            print("\n请选择邻区规划类型:")
+            print("1. NR到NR邻区关系规划")
+            print("2. LTE到LTE邻区关系规划")
+            print("3. NR到LTE邻区关系规划")
+            print("4. 全部类型邻区关系规划")
+
+            planning_choice = input("请输入选择 (1/2/3/4): ").strip()
+
+            if planning_choice == "4":
+                # 全部类型规划
+                planning_types = ['NR到NR', 'LTE到LTE', 'NR到LTE']
+            else:
+                planning_types = []
+                if planning_choice == "1":
+                    planning_types = ['NR到NR']
+                elif planning_choice == "2":
+                    planning_types = ['LTE到LTE']
+                elif planning_choice == "3":
+                    planning_types = ['NR到LTE']
+                else:
+                    print("无效选择，返回主菜单")
+                    return
+
+            # 执行邻区规划
+            neighbor_tool = NeighborPlanningTool(neighbor_distance, max_neighbors)
+
+            success_count = 0
+            for planning_type in planning_types:
+                print(f"\n--- 正在执行 {planning_type} 规划 ---")
+                if neighbor_tool.run_neighbor_planning(cells_file, params_file, planning_type):
+                    success_count += 1
+                    print(f"✅ {planning_type} 规划完成")
+                else:
+                    print(f"❌ {planning_type} 规划失败")
+
+            if success_count == len(planning_types):
+                print(f"\\n邻区规划完成！共成功执行 {success_count} 个类型的规划")
+            else:
+                print(f"\\n邻区规划部分完成！成功 {success_count}/{len(planning_types)} 个类型")
+            return
+        elif main_choice == "4":
             print("程序退出")
             return
         else:
             print("无效选择，程序退出")
             return
+
+    elif main_choice == "3":
+        # 独立的邻区规划功能
+        print("\\n=== 邻区规划功能 ===")
+
+        # 检查待规划小区文件是否存在
+        if not os.path.exists(cells_file):
+            print(f"错误: 找不到待规划小区文件: {cells_file}")
+            return
+
+        # 获取用户输入的邻区规划参数
+        print("请输入邻区规划参数:")
+
+        # 邻区关系规划距离
+        while True:
+            try:
+                neighbor_distance = float(input(f"邻区关系规划距离 (km，默认2.0): ").strip() or "2.0")
+                if neighbor_distance > 0:
+                    break
+                else:
+                    print("邻区距离必须大于0，请重新输入")
+            except ValueError:
+                print("请输入有效的数字")
+
+        # 最大邻区数量
+        while True:
+            try:
+                max_neighbors = int(input(f"每个小区的最大邻区数量 (默认16): ").strip() or "16")
+                if max_neighbors > 0:
+                    break
+                else:
+                    print("最大邻区数量必须大于0，请重新输入")
+            except ValueError:
+                print("请输入有效的整数")
+
+        # 选择邻区规划类型
+        print("\n请选择邻区规划类型:")
+        print("1. NR到NR邻区关系规划")
+        print("2. LTE到LTE邻区关系规划")
+        print("3. NR到LTE邻区关系规划")
+        print("4. 全部类型邻区关系规划")
+
+        planning_choice = input("请输入选择 (1/2/3/4): ").strip()
+
+        if planning_choice == "4":
+            # 全部类型规划
+            planning_types = ['NR到NR', 'LTE到LTE', 'NR到LTE']
+        else:
+            planning_types = []
+            if planning_choice == "1":
+                planning_types = ['NR到NR']
+            elif planning_choice == "2":
+                planning_types = ['LTE到LTE']
+            elif planning_choice == "3":
+                planning_types = ['NR到LTE']
+            else:
+                print("无效选择，返回主菜单")
+                return
+
+        # 执行邻区规划
+        neighbor_tool = NeighborPlanningTool(neighbor_distance, max_neighbors)
+
+        success_count = 0
+        for planning_type in planning_types:
+            print(f"\n--- 正在执行 {planning_type} 规划 ---")
+            if neighbor_tool.run_neighbor_planning(cells_file, params_file, planning_type):
+                success_count += 1
+                print(f"✅ {planning_type} 规划完成")
+            else:
+                print(f"❌ {planning_type} 规划失败")
+
+        if success_count == len(planning_types):
+            print(f"\\n邻区规划完成！共成功执行 {success_count} 个类型的规划")
+        else:
+            print(f"\\n邻区规划部分完成！成功 {success_count}/{len(planning_types)} 个类型")
+        return
     
     # 以下是原有的PCI规划功能
     # 检查两种网络类型的待规划小区
