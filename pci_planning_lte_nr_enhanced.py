@@ -1312,14 +1312,12 @@ class NeighborPlanningTool:
             # LTE使用eNodeB ID + Cell ID
             enodeb_id = str(row.get('enodeb_id', '')).strip()
             cell_id = str(row.get('cell_id', '')).strip()
-            return f"LTE_{enodeb_id}_{cell_id}"
+            return f"{enodeb_id}_{cell_id}"
         else:  # NR
-            # NR使用MCC + MNC + gNodeB ID + Cell ID
-            mcc = str(row.get('mcc', '')).strip()
-            mnc = str(row.get('mnc', '')).strip()
+            # NR使用gNodeB ID + Cell ID
             gnodeb_id = str(row.get('enodeb_id', '')).strip()
             cell_id = str(row.get('cell_id', '')).strip()
-            return f"NR_{mcc}_{mnc}_{gnodeb_id}_{cell_id}"
+            return f"{gnodeb_id}_{cell_id}"
 
     def get_cell_key_no_prefix(self, row: pd.Series, network_type: str) -> str:
         """
@@ -4417,8 +4415,10 @@ def main():
                     # 生成带时间后缀的文件名
                     timestamp = planner.generate_timestamp_suffix()
                     mod_suffix = "mod3" if lte_inherit_mod3 else "nomod3"
-                    output_file = f"pci_planning_{network_type.lower()}_{reuse_distance}km_{mod_suffix}_{timestamp}.xlsx"
-                    
+                    output_dir = "输出文件"
+                    os.makedirs(output_dir, exist_ok=True)
+                    output_file = f"{output_dir}/pci_planning_{network_type.lower()}_{reuse_distance}km_{mod_suffix}_{timestamp}.xlsx"
+
                     result_df.to_excel(output_file, index=False)
                     print(f"\\n[成功] {network_type}规划结果已保存到: {output_file}")
                     
@@ -4560,9 +4560,11 @@ def main():
                         mod_suffix = "mod3" if lte_inherit_mod3 else "nomod3"
                     else:
                         mod_suffix = "mod30" if nr_inherit_mod30 else "nomod30"
-                        
-                    output_file = f"pci_planning_{network_type.lower()}_{reuse_distance}km_{mod_suffix}_{timestamp}.xlsx"
-                    
+
+                    output_dir = "输出文件"
+                    os.makedirs(output_dir, exist_ok=True)
+                    output_file = f"{output_dir}/pci_planning_{network_type.lower()}_{reuse_distance}km_{mod_suffix}_{timestamp}.xlsx"
+
                     result_df.to_excel(output_file, index=False)
                     print(f"\\n[成功] {network_type}规划结果已保存到: {output_file}")
                     
