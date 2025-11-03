@@ -1153,6 +1153,36 @@ class NeighborPlanningTool:
         """生成时间戳后缀"""
         return datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    def calculate_distances_vectorized(self, target_lat: float, target_lon: float,
+                                     source_lats: np.ndarray, source_lons: np.ndarray) -> np.ndarray:
+        """
+        向量化计算距离 - 优化版本
+        批量计算一个目标点到多个源点的距离
+
+        Args:
+            target_lat: 目标纬度
+            target_lon: 目标经度
+            source_lats: 源点纬度数组
+            source_lons: 源点经度数组
+
+        Returns:
+            np.ndarray: 距离数组
+        """
+        # 转换为弧度
+        target_lat_rad = math.radians(target_lat)
+        target_lon_rad = math.radians(target_lon)
+        source_lats_rad = np.radians(source_lats)
+        source_lons_rad = np.radians(source_lons)
+
+        # Haversine公式
+        dlat = source_lats_rad - target_lat_rad
+        dlon = source_lons_rad - target_lon_rad
+        a = np.sin(dlat/2)**2 + math.cos(target_lat_rad) * np.cos(source_lats_rad) * np.sin(dlon/2)**2
+        c = 2 * np.arcsin(np.sqrt(a))
+
+        # 地球半径（公里）
+        return c * 6371.0
+
     def calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """
         计算两点间的球面距离（公里）
@@ -2306,7 +2336,96 @@ class LTENRPCIPlanner:
         result = (is_valid, min_distance)
         self.pci_validity_cache[cache_key] = result
         return result
-    
+
+    def validate_multiple_pci_reuse_distance(self, candidate_pcis: List[int], target_lat: float, target_lon: float,
+                                           target_earfcn: float, exclude_enodeb: int = None,
+                                           exclude_cell: int = None) -> List[Tuple[int, bool, float]]:
+        """
+        批量验证多个PCI的复用距离要求 - 向量化优化版本
+        大幅提升性能，避免逐个PCI验证的开销
+
+        Args:
+            candidate_pcis: 候选PCI列表
+            target_lat: 目标纬度
+            target_lon: 目标经度
+            target_earfcn: 下行频点
+            exclude_enodeb: 要排除的基站ID
+            exclude_cell: 要排除的小区ID
+
+        Returns:
+            List of (pci, is_valid, min_distance) tuples
+        """
+        if self.all_cells_combined is None or self.all_cells_combined.empty:
+            return [(pci, True, float('inf')) for pci in candidate_pcis]
+
+        results = []
+
+        # 按PCI值分组，避免重复计算相同PCI的距离
+        unique_pcis = list(set(candidate_pcis))
+        pci_validity_map = {}
+
+        for pci in unique_pcis:
+            # 检查缓存
+            cache_key = (pci, round(target_lat, 6), round(target_lon, 6),
+                        round(target_earfcn, 2), exclude_enodeb, exclude_cell,
+                        round(self.reuse_distance_km, 2))
+
+            if cache_key in self.pci_validity_cache:
+                pci_validity_map[pci] = self.pci_validity_cache[cache_key]
+                continue
+
+            # 只查找同频同PCI的小区
+            same_freq_same_pci_cells = self.all_cells_combined[
+                (self.all_cells_combined['pci'] == pci) &
+                (self.all_cells_combined['pci'].notna()) &
+                (self.all_cells_combined['earfcn_dl'] == target_earfcn) &
+                (self.all_cells_combined['earfcn_dl'].notna())
+            ].copy()
+
+            # 排除当前小区自己
+            if exclude_enodeb is not None and exclude_cell is not None:
+                same_freq_same_pci_cells = same_freq_same_pci_cells[
+                    ~((same_freq_same_pci_cells['enodeb_id'] == exclude_enodeb) &
+                      (same_freq_same_pci_cells['cell_id'] == exclude_cell))
+                ]
+
+            # 过滤有效位置的小区
+            same_freq_same_pci_cells = same_freq_same_pci_cells.dropna(subset=['lat', 'lon'])
+
+            if same_freq_same_pci_cells.empty:
+                validity_result = (True, float('inf'))
+                pci_validity_map[pci] = validity_result
+                self.pci_validity_cache[cache_key] = validity_result
+                continue
+
+            # 向量化计算到所有同频同PCI小区的距离
+            distances = self.calculate_distance_vectorized(
+                target_lat, target_lon,
+                same_freq_same_pci_cells['lat'].values,
+                same_freq_same_pci_cells['lon'].values
+            )
+
+            min_distance = np.min(distances)
+
+            # 检查是否有同站点PCI冲突
+            same_site_cells = self.get_same_site_cells(target_lat, target_lon, exclude_enodeb, exclude_cell)
+            for same_site_cell in same_site_cells:
+                same_site_pci = same_site_cell.get('pci')
+                if pd.notna(same_site_pci) and same_site_pci == pci:
+                    validity_result = (False, 0.0)
+                    pci_validity_map[pci] = validity_result
+                    self.pci_validity_cache[cache_key] = validity_result
+                    break
+            else:
+                # 没有发现同站点PCI冲突
+                is_valid = min_distance >= self.reuse_distance_km
+                validity_result = (is_valid, min_distance)
+                pci_validity_map[pci] = validity_result
+                self.pci_validity_cache[cache_key] = validity_result
+
+        # 为每个候选PCI返回结果
+        return [(pci,) + pci_validity_map[pci] for pci in candidate_pcis]
+
     def get_same_site_cells(self, target_lat: float, target_lon: float, exclude_enodeb_id: int = None, exclude_cell_id: int = None) -> List[Dict]:
         """
         获取同站点的其他小区信息
@@ -2550,16 +2669,18 @@ class LTENRPCIPlanner:
             if len(same_site_mod3s) >= 3:
                 print(f"    警告：同站点已有3种不同模3值，将强制选择不同模3值")
         
+        # 向量化优化：批量验证所有候选PCI的复用距离，避免循环调用
+        print(f"    向量化优化：批量验证{len(candidate_pcis)}个候选PCI的复用距离...")
+        batch_validation_results = self.validate_multiple_pci_reuse_distance(
+            candidate_pcis, target_lat, target_lon, target_earfcn, exclude_enodeb, exclude_cell
+        )
+
         # 检查候选PCI
-        for pci in candidate_pcis:
+        for pci, is_valid, min_distance in batch_validation_results:
             # 1. 首先检查复用距离（最高优先级）
-            is_valid, min_distance = self.validate_pci_reuse_distance(
-                pci, target_lat, target_lon, target_earfcn, exclude_enodeb, exclude_cell
-            )
-            
             if not is_valid:
                 continue  # 不满足复用距离要求的PCI直接跳过
-            
+
             # 2. 检查同站点模值冲突（第二优先级）
             candidate_mod = pci % self.mod_value
             has_same_site_mod_conflict = candidate_mod in same_site_mods
@@ -2580,7 +2701,7 @@ class LTENRPCIPlanner:
                 else:
                     # print(f"      [关键调试] NR候选PCI={pci} (mod3={pci%3}) 无同站模3冲突，可以接受")
                     pass
-            
+
             # 3. 计算PCI分布均衡性指标（第三优先级）
             # 距离越接近阈值越均衡
             if min_distance == float('inf'):
@@ -3074,28 +3195,34 @@ class LTENRPCIPlanner:
         try:
             print(f"    [验证开始] PCI={pci}, 原始复用距离={original_distance}km")
 
-            # 2. 检查是否存在同频复用距离冲突（排除自身小区）
-            reuse_conflicts = 0
-            for _, existing_cell in self.all_cells_combined.iterrows():
-                # 排除自身小区（基于基站ID和小区ID）
-                if (existing_cell['enodeb_id'] == enodeb_id and
-                    existing_cell['cell_id'] == cell_id):
-                    continue
+            # 向量化优化：批量检查同频复用距离冲突
+            # 筛选出同频同PCI的小区（排除自身）
+            same_freq_same_pci_cells = self.all_cells_combined[
+                (self.all_cells_combined['pci'] == pci) &
+                (self.all_cells_combined['pci'].notna()) &
+                (self.all_cells_combined['pci'] != 0) &
+                (self.all_cells_combined['earfcn_dl'] == earfcn_dl) &
+                (self.all_cells_combined['earfcn_dl'].notna()) &
+                ~((self.all_cells_combined['enodeb_id'] == enodeb_id) &
+                  (self.all_cells_combined['cell_id'] == cell_id))
+            ].copy()
 
-                # 只检查已分配的PCI（排除未分配的PCI=0）
-                if (existing_cell['pci'] == pci and
-                    existing_cell['earfcn_dl'] == earfcn_dl and
-                    pd.notna(existing_cell['pci']) and existing_cell['pci'] != 0):
+            if not same_freq_same_pci_cells.empty:
+                # 向量化计算距离
+                distances = self.calculate_distance_vectorized(
+                    lat, lon,
+                    same_freq_same_pci_cells['lat'].values,
+                    same_freq_same_pci_cells['lon'].values
+                )
 
-                    # 计算距离
-                    distance = self.calculate_distance(lat, lon, existing_cell['lat'], existing_cell['lon'])
-                    print(f"    [检查] 同频PCI={pci}, 距离={distance:.2f}km")
+                # 找到最小距离
+                min_distance = np.min(distances)
+                print(f"    [检查] 同频PCI={pci}, 最小距离={min_distance:.2f}km")
 
-                    # 检查是否违反复用距离（距离小于最小复用距离且大于0）
-                    if 0 < distance < original_distance:
-                        reuse_conflicts += 1
-                        print(f"    [验证失败] 复用距离冲突: PCI={pci}, 距离={distance:.2f}km < {original_distance}km")
-                        return False
+                # 检查是否违反复用距离
+                if 0 < min_distance < original_distance:
+                    print(f"    [验证失败] 复用距离冲突: PCI={pci}, 距离={min_distance:.2f}km < {original_distance}km")
+                    return False
 
             print(f"    [检查完成] 复用距离检查通过，无冲突")
 
@@ -3117,19 +3244,33 @@ class LTENRPCIPlanner:
                         return False
                     print(f"    [检查通过] NR模3约束")
 
-                    # 检查模30冲突（只检查同站其他小区）
-                    for _, existing_cell in self.all_cells_combined.iterrows():
-                        # 只检查同站的其他已分配小区
-                        if (existing_cell['enodeb_id'] == enodeb_id and
-                            existing_cell['cell_id'] != cell_id and
-                            existing_cell['earfcn_dl'] == earfcn_dl and
-                            pd.notna(existing_cell['pci']) and existing_cell['pci'] != 0):
+                    # 向量化优化：检查模30冲突（只检查同站其他小区）
+                    # 筛选同站的其他已分配小区
+                    same_site_other_cells = self.all_cells_combined[
+                        (self.all_cells_combined['enodeb_id'] == enodeb_id) &
+                        (self.all_cells_combined['cell_id'] != cell_id) &
+                        (self.all_cells_combined['earfcn_dl'] == earfcn_dl) &
+                        (self.all_cells_combined['pci'].notna()) &
+                        (self.all_cells_combined['pci'] != 0)
+                    ].copy()
 
-                            distance = self.calculate_distance(lat, lon, existing_cell['lat'], existing_cell['lon'])
-                            if distance < 0.01:  # 同站判断距离阈值
-                                if pci % 30 == existing_cell['pci'] % 30:
-                                    print(f"    [验证失败] NR同站模30冲突: PCI={pci} (mod30={pci%30}) vs 现有PCI={existing_cell['pci']} (mod30={existing_cell['pci']%30})")
-                                    return False
+                    if not same_site_other_cells.empty:
+                        # 向量化计算距离
+                        distances = self.calculate_distance_vectorized(
+                            lat, lon,
+                            same_site_other_cells['lat'].values,
+                            same_site_other_cells['lon'].values
+                        )
+
+                        # 筛选出同站小区（距离<0.01km）
+                        same_site_mask = distances < 0.01
+                        same_site_cells = same_site_other_cells[same_site_mask]
+
+                        # 检查模30冲突
+                        for _, existing_cell in same_site_cells.iterrows():
+                            if pci % 30 == existing_cell['pci'] % 30:
+                                print(f"    [验证失败] NR同站模30冲突: PCI={pci} (mod30={pci%30}) vs 现有PCI={existing_cell['pci']} (mod30={existing_cell['pci']%30})")
+                                return False
 
                     print(f"    [检查通过] NR模30约束")
 
@@ -3146,19 +3287,33 @@ class LTENRPCIPlanner:
                 self.all_cells_combined.loc[temp_cell_mask, 'pci'] = pci
 
                 try:
-                    # LTE模3约束检查
-                    for _, existing_cell in self.all_cells_combined.iterrows():
-                        # 只检查同站的其他已分配小区
-                        if (existing_cell['enodeb_id'] == enodeb_id and
-                            existing_cell['cell_id'] != cell_id and
-                            existing_cell['earfcn_dl'] == earfcn_dl and
-                            pd.notna(existing_cell['pci']) and existing_cell['pci'] != 0):
+                    # 向量化优化：LTE模3约束检查
+                    # 筛选同站的其他已分配小区
+                    same_site_other_cells = self.all_cells_combined[
+                        (self.all_cells_combined['enodeb_id'] == enodeb_id) &
+                        (self.all_cells_combined['cell_id'] != cell_id) &
+                        (self.all_cells_combined['earfcn_dl'] == earfcn_dl) &
+                        (self.all_cells_combined['pci'].notna()) &
+                        (self.all_cells_combined['pci'] != 0)
+                    ].copy()
 
-                            distance = self.calculate_distance(lat, lon, existing_cell['lat'], existing_cell['lon'])
-                            if distance < 0.01:  # 同站判断距离阈值
-                                if pci % 3 == existing_cell['pci'] % 3:
-                                    print(f"    [验证失败] LTE同站模3冲突: PCI={pci} (mod3={pci%3}) vs 现有PCI={existing_cell['pci']} (mod3={existing_cell['pci']%3})")
-                                    return False
+                    if not same_site_other_cells.empty:
+                        # 向量化计算距离
+                        distances = self.calculate_distance_vectorized(
+                            lat, lon,
+                            same_site_other_cells['lat'].values,
+                            same_site_other_cells['lon'].values
+                        )
+
+                        # 筛选出同站小区（距离<0.01km）
+                        same_site_mask = distances < 0.01
+                        same_site_cells = same_site_other_cells[same_site_mask]
+
+                        # 检查模3冲突
+                        for _, existing_cell in same_site_cells.iterrows():
+                            if pci % 3 == existing_cell['pci'] % 3:
+                                print(f"    [验证失败] LTE同站模3冲突: PCI={pci} (mod3={pci%3}) vs 现有PCI={existing_cell['pci']} (mod3={existing_cell['pci']%3})")
+                                return False
 
                     print(f"    [检查通过] LTE模3约束")
 
