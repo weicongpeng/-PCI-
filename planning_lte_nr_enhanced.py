@@ -4283,71 +4283,119 @@ def main():
                 print(f"错误: 找不到待规划小区文件: {cells_file}")
                 return
 
-            # 获取用户输入的邻区规划参数
-            print("请输入邻区规划参数:")
+            # 邻区规划类型映射
+            planning_type_map = {
+                "1": "NR到NR",
+                "2": "LTE到LTE",
+                "3": "NR到LTE"
+            }
 
-            # 邻区关系规划距离
-            while True:
-                try:
-                    neighbor_distance = float(input(f"邻区关系规划距离 (km，默认2.0): ").strip() or "2.0")
-                    if neighbor_distance > 0:
-                        break
-                    else:
-                        print("邻区距离必须大于0，请重新输入")
-                except ValueError:
-                    print("请输入有效的数字")
-
-            # 最大邻区数量
-            while True:
-                try:
-                    max_neighbors = int(input(f"每个小区的最大邻区数量 (默认16): ").strip() or "16")
-                    if max_neighbors > 0:
-                        break
-                    else:
-                        print("最大邻区数量必须大于0，请重新输入")
-                except ValueError:
-                    print("请输入有效的整数")
-
-            # 选择邻区规划类型
-            print("\n请选择邻区规划类型:")
-            print("1. NR到NR邻区关系规划")
-            print("2. LTE到LTE邻区关系规划")
-            print("3. NR到LTE邻区关系规划")
-            print("4. 全部类型邻区关系规划")
-
-            planning_choice = input("请输入选择 (1/2/3/4): ").strip()
-
-            if planning_choice == "4":
-                # 全部类型规划
-                planning_types = ['NR到NR', 'LTE到LTE', 'NR到LTE']
-            else:
-                planning_types = []
-                if planning_choice == "1":
-                    planning_types = ['NR到NR']
-                elif planning_choice == "2":
-                    planning_types = ['LTE到LTE']
-                elif planning_choice == "3":
-                    planning_types = ['NR到LTE']
-                else:
-                    print("无效选择，返回主菜单")
-                    return
-
-            # 执行邻区规划
-            neighbor_tool = NeighborPlanningTool(neighbor_distance, max_neighbors)
-
+            planned_types = []  # 已规划的类型
             success_count = 0
-            for planning_type in planning_types:
-                print(f"\n--- 正在执行 {planning_type} 规划 ---")
-                if neighbor_tool.run_neighbor_planning(cells_file, params_file, planning_type):
-                    success_count += 1
-                    print(f"✅ {planning_type} 规划完成")
-                else:
-                    print(f"❌ {planning_type} 规划失败")
 
-            if success_count == len(planning_types):
-                print(f"\\n邻区规划完成！共成功执行 {success_count} 个类型的规划")
+            # 允许用户逐个选择和规划每个类型
+            while True:
+                print(f"\n{'='*50}")
+                print("请选择邻区规划类型:")
+                print("1. NR到NR邻区关系规划")
+                print("2. LTE到LTE邻区关系规划")
+                print("3. NR到LTE邻区关系规划")
+                print("4. 查看已完成的规划")
+                print("5. 完成规划并退出")
+
+                if planned_types:
+                    print(f"\n当前已完成的规划类型: {', '.join(planned_types)}")
+
+                planning_choice = input("\n请输入选择 (1/2/3/4/5): ").strip()
+
+                if planning_choice == "5":
+                    # 完成规划
+                    break
+                elif planning_choice == "4":
+                    # 查看已完成的规划
+                    if planned_types:
+                        print(f"\n已完成的邻区规划类型: {', '.join(planned_types)}")
+                        for ptype in planned_types:
+                            print(f"  - {ptype}")
+                    else:
+                        print("\n还没有完成任何邻区规划")
+                    continue
+                elif planning_choice in planning_type_map:
+                    planning_type = planning_type_map[planning_choice]
+
+                    # 检查是否已经规划过
+                    if planning_type in planned_types:
+                        print(f"\n⚠️  {planning_type} 已经规划过，是否重新规划？")
+                        replan = input("重新规划？(y/n，默认n): ").strip().lower()
+                        if replan not in ['y', 'yes', '是']:
+                            continue  # 跳过已规划的类型
+
+                    # 为该规划类型输入专属参数
+                    print(f"\n{'='*50}")
+                    print(f"为 {planning_type} 输入邻区规划参数:")
+
+                    # 邻区关系规划距离
+                    while True:
+                        try:
+                            neighbor_distance = float(input(f"邻区关系规划距离 (km，默认2.0): ").strip() or "2.0")
+                            if neighbor_distance > 0:
+                                break
+                            else:
+                                print("邻区距离必须大于0，请重新输入")
+                        except ValueError:
+                            print("请输入有效的数字")
+
+                    # 最大邻区数量
+                    while True:
+                        try:
+                            max_neighbors = int(input(f"每个小区的最大邻区数量 (默认16): ").strip() or "16")
+                            if max_neighbors > 0:
+                                break
+                            else:
+                                print("最大邻区数量必须大于0，请重新输入")
+                        except ValueError:
+                            print("请输入有效的整数")
+
+                    # 创建邻区规划工具实例（每个类型使用独立参数）
+                    neighbor_tool = NeighborPlanningTool(neighbor_distance, max_neighbors)
+
+                    # 执行规划
+                    print(f"\n{'='*50}")
+                    print(f"正在执行 {planning_type} 规划...")
+                    print(f"参数: 邻区距离={neighbor_distance}km, 最大邻区数={max_neighbors}")
+                    print(f"{'='*50}")
+
+                    if neighbor_tool.run_neighbor_planning(cells_file, params_file, planning_type):
+                        success_count += 1
+                        print(f"\n✅ {planning_type} 规划完成")
+
+                        # 添加到已规划列表
+                        if planning_type not in planned_types:
+                            planned_types.append(planning_type)
+                    else:
+                        print(f"\n❌ {planning_type} 规划失败")
+
+                    # 规划完成后询问是否继续
+                    print(f"\n{'='*50}")
+                    continue_choice = input("是否继续规划其他类型？(y/n，默认y): ").strip().lower()
+                    if continue_choice in ['n', 'no', '否']:
+                        break
+                else:
+                    print("无效选择，请输入1-5之间的数字")
+                    continue
+
+            # 总结
+            print(f"\n{'='*60}")
+            print("邻区规划执行总结")
+            print(f"{'='*60}")
+            if planned_types:
+                print(f"已完成的规划类型 ({len(planned_types)}个):")
+                for ptype in planned_types:
+                    print(f"  ✅ {ptype}")
+                print(f"\n总计成功执行: {success_count} 个类型的规划")
             else:
-                print(f"\\n邻区规划部分完成！成功 {success_count}/{len(planning_types)} 个类型")
+                print("未执行任何邻区规划")
+
             return
         elif main_choice == "4":
             print("程序退出")
@@ -4365,71 +4413,119 @@ def main():
             print(f"错误: 找不到待规划小区文件: {cells_file}")
             return
 
-        # 获取用户输入的邻区规划参数
-        print("请输入邻区规划参数:")
+        # 邻区规划类型映射
+        planning_type_map = {
+            "1": "NR到NR",
+            "2": "LTE到LTE",
+            "3": "NR到LTE"
+        }
 
-        # 邻区关系规划距离
-        while True:
-            try:
-                neighbor_distance = float(input(f"邻区关系规划距离 (km，默认2.0): ").strip() or "2.0")
-                if neighbor_distance > 0:
-                    break
-                else:
-                    print("邻区距离必须大于0，请重新输入")
-            except ValueError:
-                print("请输入有效的数字")
-
-        # 最大邻区数量
-        while True:
-            try:
-                max_neighbors = int(input(f"每个小区的最大邻区数量 (默认16): ").strip() or "16")
-                if max_neighbors > 0:
-                    break
-                else:
-                    print("最大邻区数量必须大于0，请重新输入")
-            except ValueError:
-                print("请输入有效的整数")
-
-        # 选择邻区规划类型
-        print("\n请选择邻区规划类型:")
-        print("1. NR到NR邻区关系规划")
-        print("2. LTE到LTE邻区关系规划")
-        print("3. NR到LTE邻区关系规划")
-        print("4. 全部类型邻区关系规划")
-
-        planning_choice = input("请输入选择 (1/2/3/4): ").strip()
-
-        if planning_choice == "4":
-            # 全部类型规划
-            planning_types = ['NR到NR', 'LTE到LTE', 'NR到LTE']
-        else:
-            planning_types = []
-            if planning_choice == "1":
-                planning_types = ['NR到NR']
-            elif planning_choice == "2":
-                planning_types = ['LTE到LTE']
-            elif planning_choice == "3":
-                planning_types = ['NR到LTE']
-            else:
-                print("无效选择，返回主菜单")
-                return
-
-        # 执行邻区规划
-        neighbor_tool = NeighborPlanningTool(neighbor_distance, max_neighbors)
-
+        planned_types = []  # 已规划的类型
         success_count = 0
-        for planning_type in planning_types:
-            print(f"\n--- 正在执行 {planning_type} 规划 ---")
-            if neighbor_tool.run_neighbor_planning(cells_file, params_file, planning_type):
-                success_count += 1
-                print(f"✅ {planning_type} 规划完成")
-            else:
-                print(f"❌ {planning_type} 规划失败")
 
-        if success_count == len(planning_types):
-            print(f"\\n邻区规划完成！共成功执行 {success_count} 个类型的规划")
+        # 允许用户逐个选择和规划每个类型
+        while True:
+            print(f"\n{'='*50}")
+            print("请选择邻区规划类型:")
+            print("1. NR到NR邻区关系规划")
+            print("2. LTE到LTE邻区关系规划")
+            print("3. NR到LTE邻区关系规划")
+            print("4. 查看已完成的规划")
+            print("5. 完成规划并退出")
+
+            if planned_types:
+                print(f"\n当前已完成的规划类型: {', '.join(planned_types)}")
+
+            planning_choice = input("\n请输入选择 (1/2/3/4/5): ").strip()
+
+            if planning_choice == "5":
+                # 完成规划
+                break
+            elif planning_choice == "4":
+                # 查看已完成的规划
+                if planned_types:
+                    print(f"\n已完成的邻区规划类型: {', '.join(planned_types)}")
+                    for ptype in planned_types:
+                        print(f"  - {ptype}")
+                else:
+                    print("\n还没有完成任何邻区规划")
+                continue
+            elif planning_choice in planning_type_map:
+                planning_type = planning_type_map[planning_choice]
+
+                # 检查是否已经规划过
+                if planning_type in planned_types:
+                    print(f"\n⚠️  {planning_type} 已经规划过，是否重新规划？")
+                    replan = input("重新规划？(y/n，默认n): ").strip().lower()
+                    if replan not in ['y', 'yes', '是']:
+                        continue  # 跳过已规划的类型
+
+                # 为该规划类型输入专属参数
+                print(f"\n{'='*50}")
+                print(f"为 {planning_type} 输入邻区规划参数:")
+
+                # 邻区关系规划距离
+                while True:
+                    try:
+                        neighbor_distance = float(input(f"邻区关系规划距离 (km，默认2.0): ").strip() or "2.0")
+                        if neighbor_distance > 0:
+                            break
+                        else:
+                            print("邻区距离必须大于0，请重新输入")
+                    except ValueError:
+                        print("请输入有效的数字")
+
+                # 最大邻区数量
+                while True:
+                    try:
+                        max_neighbors = int(input(f"每个小区的最大邻区数量 (默认16): ").strip() or "16")
+                        if max_neighbors > 0:
+                            break
+                        else:
+                            print("最大邻区数量必须大于0，请重新输入")
+                    except ValueError:
+                        print("请输入有效的整数")
+
+                # 创建邻区规划工具实例（每个类型使用独立参数）
+                neighbor_tool = NeighborPlanningTool(neighbor_distance, max_neighbors)
+
+                # 执行规划
+                print(f"\n{'='*50}")
+                print(f"正在执行 {planning_type} 规划...")
+                print(f"参数: 邻区距离={neighbor_distance}km, 最大邻区数={max_neighbors}")
+                print(f"{'='*50}")
+
+                if neighbor_tool.run_neighbor_planning(cells_file, params_file, planning_type):
+                    success_count += 1
+                    print(f"\n✅ {planning_type} 规划完成")
+
+                    # 添加到已规划列表
+                    if planning_type not in planned_types:
+                        planned_types.append(planning_type)
+                else:
+                    print(f"\n❌ {planning_type} 规划失败")
+
+                # 规划完成后询问是否继续
+                print(f"\n{'='*50}")
+                continue_choice = input("是否继续规划其他类型？(y/n，默认y): ").strip().lower()
+                if continue_choice in ['n', 'no', '否']:
+                    break
+            else:
+                print("无效选择，请输入1-5之间的数字")
+                continue
+
+        # 总结
+        print(f"\n{'='*60}")
+        print("邻区规划执行总结")
+        print(f"{'='*60}")
+        if planned_types:
+            print(f"已完成的规划类型 ({len(planned_types)}个):")
+            for ptype in planned_types:
+                print(f"  ✅ {ptype}")
+            print(f"\n总计成功执行: {success_count} 个类型的规划")
         else:
-            print(f"\\n邻区规划部分完成！成功 {success_count}/{len(planning_types)} 个类型")
+            print("未执行任何邻区规划")
+
         return
     
     # 以下是原有的PCI规划功能
